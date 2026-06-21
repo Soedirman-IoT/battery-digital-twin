@@ -5,15 +5,16 @@
 #include <ESP32Encoder.h>
 #include "esp_eap_client.h"
 #include <time.h>
+#include <vector>
 
 // =====================================================
 // WIFI WPA2 ENTERPRISE + MQTT CONFIG
 // =====================================================
 const char* WIFI_SSID = "eduroam";
 
-#define EAP_IDENTITY "email unsoed"
-#define EAP_USERNAME "email unsoed"
-#define EAP_PASSWORD "pw email"
+#define EAP_IDENTITY "dimas.anhar@mhs.unsoed.ac.id"
+#define EAP_USERNAME "dimas.anhar@mhs.unsoed.ac.id"
+#define EAP_PASSWORD "Raihananhar##23076"
 
 const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
@@ -29,9 +30,12 @@ const char* MQTT_TOPIC_CONTROL = "skripsi/bms01/control";
 const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long BLE_RECONNECT_INTERVAL_MS  = 15000;
+
+unsigned long lastBleReconnectAttempt = 0;
 
 // ================= CONTROL MODE CONFIG =================
-// AUTO   : jam 07:00-19:00 beban/motor boleh ON.
+// AUTO   : jam 01:00-23:00 beban/motor boleh ON.
 //          di luar jam itu beban/motor OFF, tetapi charge tetap boleh ON jika baterai drop.
 // MANUAL : sistem mengikuti tombol ON/OFF dari MQTT.
 enum ControlMode {
@@ -200,6 +204,10 @@ float batteryT1 = 0.0;
 float batteryT2 = 0.0;
 float mosTemp = 0.0;
 
+// SoC valid untuk JK-BMS lu berasal dari full frame realtime 0x02 byte 173.
+float bmsSoc = 0.0;
+bool socValid = false;
+
 bool voltageValid = false;
 bool currentValid = false;
 bool balanceCurrentValid = false;
@@ -230,7 +238,7 @@ const float CHARGE_START_CELL_V = 3.10;
 const float CHARGE_STOP_CELL_V  = 4.15;
 
 const float PACK_CHARGE_START_V = 18.6;
-const float PACK_CHARGE_STOP_V  = 24.6;
+const float PACK_CHARGE_STOP_V  = 24.9;
 
 const float TEMP_OFF_C = 55.0;
 
@@ -274,6 +282,25 @@ uint8_t requestDeviceInfo[] = {
   0x9D, 0x0A, 0x09, 0x6B, 0x9A, 0xF6, 0x70, 0x9A, 0x17, 0xFD
 };
 
+// ================= JK-BMS FULL FRAME PROTOCOL =================
+// JK-BMS mengirim response BLE secara terpotong, biasanya 150 + 150 byte.
+// Karena SoC valid berada di byte 173, notification harus digabung dulu
+// menjadi full frame 300 byte sebelum diparse.
+std::vector<uint8_t> bmsFrameBuffer;
+
+const size_t JK_FRAME_SIZE = 300;
+const size_t JK_MAX_FRAME_SIZE = 384 + 16;
+const uint8_t JK_SOC_BYTE_INDEX = 173;
+const int JK_RUNTIME_OFFSET = 32;  // SoC byte 173 = byte 141 + 32, cocok untuk BMS lu.
+
+uint8_t calcJKCRC(const uint8_t* data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc += data[i];
+  }
+  return crc;
+}
+
 // ================= HELPER =================
 uint16_t readUInt16LE(uint8_t* data, int index) {
   return (uint16_t)data[index] | ((uint16_t)data[index + 1] << 8);
@@ -281,6 +308,17 @@ uint16_t readUInt16LE(uint8_t* data, int index) {
 
 int16_t readInt16LE(uint8_t* data, int index) {
   return (int16_t)((uint16_t)data[index] | ((uint16_t)data[index + 1] << 8));
+}
+
+uint32_t readUInt32LE(const uint8_t* data, int index) {
+  return (uint32_t)data[index] |
+         ((uint32_t)data[index + 1] << 8) |
+         ((uint32_t)data[index + 2] << 16) |
+         ((uint32_t)data[index + 3] << 24);
+}
+
+int32_t readInt32LE(const uint8_t* data, int index) {
+  return (int32_t)readUInt32LE(data, index);
 }
 
 bool isReasonableCellVoltage(float v) {
@@ -296,7 +334,7 @@ bool isReasonableCurrent(float a) {
 }
 
 bool isReasonableTemp(float t) {
-  return t >= 10.0 && t <= 80.0;
+  return t >= -20.0 && t <= 100.0;
 }
 
 bool isBMSTimeout() {
@@ -504,7 +542,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
 void setupMQTT() {
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(1024);
+  mqttClient.setBufferSize(2048);
   mqttClient.setCallback(onMqttMessage);
 }
 
@@ -560,6 +598,8 @@ void publishMQTTData() {
       "\"voltage_valid\":%s,"
       "\"current_valid\":%s,"
       "\"temp_valid\":%s,"
+      "\"soc_valid\":%s,"
+      "\"bms_soc\":%.1f,"
       "\"pack_voltage\":%.3f,"
       "\"cell_1\":%.3f,"
       "\"cell_2\":%.3f,"
@@ -606,6 +646,8 @@ void publishMQTTData() {
     voltageValid ? "true" : "false",
     currentValid ? "true" : "false",
     tempValid ? "true" : "false",
+    socValid ? "true" : "false",
+    bmsSoc,
     packVoltage,
     cellVoltage[0],
     cellVoltage[1],
@@ -712,6 +754,158 @@ void updateEncoderData() {
 }
 
 // ================= BMS PARSING =================
+void updateFromFullJKFrame(const uint8_t* data, size_t len) {
+  if (len < JK_FRAME_SIZE) return;
+
+  bool validHeader =
+    data[0] == 0x55 &&
+    data[1] == 0xAA &&
+    data[2] == 0xEB &&
+    data[3] == 0x90;
+
+  if (!validHeader) {
+    Serial.println("Frame BMS ditolak: header bukan 55 AA EB 90");
+    return;
+  }
+
+  if (data[4] != 0x02) {
+    Serial.print("Bukan frame realtime/cell info. Type: 0x");
+    Serial.println(data[4], HEX);
+    return;
+  }
+
+  uint8_t computedCRC = calcJKCRC(data, JK_FRAME_SIZE - 1);
+  uint8_t remoteCRC = data[JK_FRAME_SIZE - 1];
+  if (computedCRC != remoteCRC) {
+    Serial.print("CRC frame BMS gagal: computed=0x");
+    Serial.print(computedCRC, HEX);
+    Serial.print(" remote=0x");
+    Serial.println(remoteCRC, HEX);
+    return;
+  }
+
+  // Cell voltage tetap berada mulai byte 6, little-endian, satuan mV.
+  float totalCell = 0.0;
+  bool cellOk = true;
+
+  for (int i = 0; i < CELL_COUNT; i++) {
+    uint16_t mv = (uint16_t)data[6 + i * 2] | ((uint16_t)data[7 + i * 2] << 8);
+    float v = mv * 0.001f;
+
+    cellVoltage[i] = v;
+    totalCell += v;
+
+    if (!isReasonableCellVoltage(v)) {
+      cellOk = false;
+    }
+  }
+
+  // SoC yang sudah lu kalibrasi dengan aplikasi JK-BMS.
+  uint8_t socRaw = data[JK_SOC_BYTE_INDEX];
+  if (socRaw <= 100) {
+    bmsSoc = (float)socRaw;
+    socValid = true;
+  } else {
+    socValid = false;
+  }
+
+  // Layout runtime ikut offset +32, karena BMS lu cocok di mode JK02_32S.
+  float totalFromFrame = readUInt32LE(data, 118 + JK_RUNTIME_OFFSET) * 0.001f;
+  if (isReasonablePackVoltage(totalFromFrame)) {
+    packVoltage = totalFromFrame;
+    voltageValid = true;
+  } else if (cellOk && isReasonablePackVoltage(totalCell)) {
+    packVoltage = totalCell;
+    voltageValid = true;
+  } else {
+    voltageValid = false;
+  }
+
+  if (cellOk) {
+    minCellVoltage = cellVoltage[0];
+    maxCellVoltage = cellVoltage[0];
+    minCellIndex = 0;
+    maxCellIndex = 0;
+
+    for (int i = 1; i < CELL_COUNT; i++) {
+      if (cellVoltage[i] < minCellVoltage) {
+        minCellVoltage = cellVoltage[i];
+        minCellIndex = i;
+      }
+
+      if (cellVoltage[i] > maxCellVoltage) {
+        maxCellVoltage = cellVoltage[i];
+        maxCellIndex = i;
+      }
+    }
+  }
+
+  float current = readInt32LE(data, 126 + JK_RUNTIME_OFFSET) * 0.001f;
+  currentValid = isReasonableCurrent(current);
+  if (currentValid) {
+    batteryCurrent = current;
+  }
+
+  float balCurrent = ((int16_t)((uint16_t)data[138 + JK_RUNTIME_OFFSET] | ((uint16_t)data[139 + JK_RUNTIME_OFFSET] << 8))) * 0.001f;
+  balanceCurrentValid = isReasonableCurrent(balCurrent);
+  if (balanceCurrentValid) {
+    balanceCurrent = balCurrent;
+  }
+
+  float t1 = ((int16_t)((uint16_t)data[130 + JK_RUNTIME_OFFSET] | ((uint16_t)data[131 + JK_RUNTIME_OFFSET] << 8))) * 0.1f;
+  float t2 = ((int16_t)((uint16_t)data[132 + JK_RUNTIME_OFFSET] | ((uint16_t)data[133 + JK_RUNTIME_OFFSET] << 8))) * 0.1f;
+  float mos = ((int16_t)((uint16_t)data[112 + JK_RUNTIME_OFFSET] | ((uint16_t)data[113 + JK_RUNTIME_OFFSET] << 8))) * 0.1f;
+
+  tempValid = isReasonableTemp(t1) && isReasonableTemp(t2);
+  if (tempValid) {
+    batteryT1 = t1;
+    batteryT2 = t2;
+    if (isReasonableTemp(mos)) {
+      mosTemp = mos;
+    }
+  }
+
+  lastBMSDataTime = millis();
+}
+
+void assembleBMSFrame(uint8_t* data, size_t len) {
+  if (len == 0) return;
+
+  bool hasHeader =
+    len >= 4 &&
+    data[0] == 0x55 &&
+    data[1] == 0xAA &&
+    data[2] == 0xEB &&
+    data[3] == 0x90;
+
+  bool isEchoOrAck =
+    len >= 4 &&
+    data[0] == 0xAA &&
+    data[1] == 0x55 &&
+    data[2] == 0x90 &&
+    data[3] == 0xEB;
+
+  if (isEchoOrAck) {
+    return;
+  }
+
+  if (hasHeader) {
+    bmsFrameBuffer.clear();
+  }
+
+  if (bmsFrameBuffer.size() + len > JK_MAX_FRAME_SIZE) {
+    Serial.println("Frame buffer BMS terlalu panjang, reset buffer.");
+    bmsFrameBuffer.clear();
+  }
+
+  bmsFrameBuffer.insert(bmsFrameBuffer.end(), data, data + len);
+
+  if (bmsFrameBuffer.size() >= JK_FRAME_SIZE) {
+    updateFromFullJKFrame(bmsFrameBuffer.data(), bmsFrameBuffer.size());
+    bmsFrameBuffer.clear();
+  }
+}
+
 void updateVoltageData(uint8_t* data, size_t len) {
   if (len < 6 + CELL_COUNT * 2) return;
 
@@ -1018,6 +1212,14 @@ void printDataForControl() {
     Serial.println("Data tegangan          : belum valid");
   }
 
+  if (socValid) {
+    Serial.print("SoC Baterai            : ");
+    Serial.print(bmsSoc, 1);
+    Serial.println(" %");
+  } else {
+    Serial.println("SoC Baterai            : belum valid");
+  }
+
   if (currentValid) {
     Serial.print("Arus Baterai           : ");
     Serial.print(batteryCurrent, 3);
@@ -1115,28 +1317,9 @@ void printDataForControl() {
 
 // ================= BLE CALLBACK =================
 void parseNotify(uint8_t* data, size_t len) {
-  if (len < 20) return;
-
-  bool isVoltageFrame =
-    data[0] == 0x55 &&
-    data[1] == 0xAA &&
-    data[2] == 0xEB &&
-    data[3] == 0x90 &&
-    data[4] == 0x02;
-
-  if (isVoltageFrame) {
-    updateVoltageData(data, len);
-    return;
-  }
-
-  bool isExtraFrame =
-    !(data[0] == 0x55 && data[1] == 0xAA) &&
-    len > 120;
-
-  if (isExtraFrame) {
-    updateExtraData(data, len);
-    return;
-  }
+  // Protokol baru: notification BLE digabung dulu sampai full frame 300 byte,
+  // lalu seluruh data BMS, termasuk SoC byte 173, diparse dari frame realtime 0x02.
+  assembleBMSFrame(data, len);
 }
 
 void notifyCallback(
@@ -1149,8 +1332,30 @@ void notifyCallback(
 }
 
 // ================= BLE CONNECT =================
+
+void cleanupBMSClient() {
+  dataChar = nullptr;
+
+  if (client != nullptr) {
+    if (client->isConnected()) {
+      client->disconnect();
+      delay(200);
+    }
+
+    NimBLEDevice::deleteClient(client);
+    client = nullptr;
+  }
+}
+
+bool isBMSConnected() {
+  return client != nullptr && client->isConnected() && dataChar != nullptr;
+}
+
 bool connectToBMS() {
-  Serial.println("Scanning...");
+  cleanupBMSClient();
+  bmsFrameBuffer.clear();
+
+  Serial.println("Scanning BMS BLE...");
 
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
@@ -1175,6 +1380,7 @@ bool connectToBMS() {
   if (target == nullptr) {
     Serial.println("BMS not found.");
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
@@ -1184,6 +1390,7 @@ bool connectToBMS() {
   if (!client->connect(target)) {
     Serial.println("Connect failed.");
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
@@ -1192,29 +1399,50 @@ bool connectToBMS() {
   NimBLERemoteService* service = client->getService("ffe0");
   if (!service) {
     Serial.println("Service FFE0 not found.");
-    client->disconnect();
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
   dataChar = service->getCharacteristic("ffe1");
   if (!dataChar) {
     Serial.println("FFE1 not found.");
-    client->disconnect();
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
   if (!dataChar->subscribe(true, notifyCallback)) {
     Serial.println("Subscribe failed.");
-    client->disconnect();
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
   Serial.println("Subscribed to notify.");
   scan->clearResults();
   return true;
+}
+
+void maintainBMSConnection() {
+  if (isBMSConnected()) return;
+
+  systemMode = MODE_SAFE_OFF;
+  allRelayOff();
+  socValid = false;
+  bmsFrameBuffer.clear();
+
+  unsigned long now = millis();
+  if (now - lastBleReconnectAttempt < BLE_RECONNECT_INTERVAL_MS) return;
+  lastBleReconnectAttempt = now;
+
+  Serial.println("BMS BLE disconnected/timeout. Relay OFF. Trying reconnect...");
+
+  if (connectToBMS()) {
+    delay(300);
+    sendInitialSequence();
+    Serial.println("BMS BLE reconnected.");
+  }
 }
 
 void sendFrame(uint8_t* frame, size_t len, const char* label) {
@@ -1244,7 +1472,10 @@ void setup() {
 
   allRelayOff();
 
-  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  // GPIO34 dan GPIO35 adalah input-only dan TIDAK punya internal pull-up.
+  // Jangan aktifkan internal pull-up, karena akan memunculkan error gpio_pullup_en.
+  // Pasang pull-up eksternal 4.7k-10k ke 3.3V pada kanal A dan B encoder.
+  ESP32Encoder::useInternalWeakPullResistors = puType::none;
   encoder.attachFullQuad(ENCODER_A, ENCODER_B);
   encoder.clearCount();
 
@@ -1278,31 +1509,26 @@ void loop() {
 
   maintainWiFi();
   maintainMQTT();
+  maintainBMSConnection();
 
   updateEncoderData();
 
-  if (client && client->isConnected()) {
-    if (millis() - lastRequest > 30000) {
-      lastRequest = millis();
-      sendInitialSequence();
-    }
-
-    if (millis() - lastControl > 500) {
-      lastControl = millis();
-      controlRelays();
-    }
-
-    publishMQTTData();
-
-    if (millis() - lastPrint > 5000) {
-      lastPrint = millis();
-      printDataForControl();
-    }
-  } else {
-    systemMode = MODE_SAFE_OFF;
-    allRelayOff();
-
-    Serial.println("BMS disconnected. Relay OFF. Restart ESP32 or improve BLE connection.");
-    delay(5000);
+  if (isBMSConnected() && millis() - lastRequest > 30000) {
+    lastRequest = millis();
+    sendInitialSequence();
   }
+
+  if (millis() - lastControl > 500) {
+    lastControl = millis();
+    controlRelays();
+  }
+
+  publishMQTTData();
+
+  if (millis() - lastPrint > 1000) {
+    lastPrint = millis();
+    printDataForControl();
+  }
+
+  delay(5);
 }
