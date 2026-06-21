@@ -5,6 +5,7 @@
 #include <ESP32Encoder.h>
 #include "esp_eap_client.h"
 #include <time.h>
+#include <vector>
 
 // =====================================================
 // WIFI WPA2 ENTERPRISE + MQTT CONFIG
@@ -151,6 +152,12 @@ float batteryT1 = 0.0;
 float batteryT2 = 0.0;
 float mosTemp = 0.0;
 
+// SoC valid dari JK-BMS lu ada di byte 173 pada full frame realtime 300 byte.
+// Acuan: hasil kalibrasi dengan aplikasi JK-BMS menunjukkan byte 173 cocok,
+// sedangkan byte 141 bernilai 0 pada BMS ini.
+float bmsSoc = 0.0;
+bool socValid = false;
+
 bool voltageValid = false;
 bool currentValid = false;
 bool balanceCurrentValid = false;
@@ -223,6 +230,24 @@ uint8_t requestDeviceInfo[] = {
   0xAA, 0x55, 0x90, 0xEB, 0x97, 0x00, 0xDF, 0x52, 0x88, 0x67,
   0x9D, 0x0A, 0x09, 0x6B, 0x9A, 0xF6, 0x70, 0x9A, 0x17, 0xFD
 };
+
+// ================= FULL FRAME BUFFER UNTUK SoC =================
+// JK-BMS mengirim response BLE secara terpotong, biasanya 150 + 150 byte.
+// Karena SoC valid berada di byte 173, notification harus digabung dulu
+// menjadi full frame sebelum diparse.
+std::vector<uint8_t> bmsFrameBuffer;
+
+const size_t JK_MIN_FRAME_SIZE = 300;
+const size_t JK_MAX_FRAME_SIZE = 400;
+const uint8_t JK_SOC_BYTE_INDEX = 173;
+
+uint8_t calcJKCRC(const uint8_t* data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc += data[i];
+  }
+  return crc;
+}
 
 // ================= HELPER =================
 uint16_t readUInt16LE(uint8_t* data, int index) {
@@ -499,7 +524,7 @@ void publishMQTTData() {
   if (now - lastMqttPublish < MQTT_PUBLISH_INTERVAL_MS) return;
   lastMqttPublish = now;
 
-  char payload[1024];
+  char payload[1200];
 
   snprintf(
     payload,
@@ -510,6 +535,8 @@ void publishMQTTData() {
       "\"voltage_valid\":%s,"
       "\"current_valid\":%s,"
       "\"temp_valid\":%s,"
+      "\"soc_valid\":%s,"
+      "\"bms_soc\":%.1f,"
       "\"pack_voltage\":%.3f,"
       "\"cell_1\":%.3f,"
       "\"cell_2\":%.3f,"
@@ -553,6 +580,8 @@ void publishMQTTData() {
     voltageValid ? "true" : "false",
     currentValid ? "true" : "false",
     tempValid ? "true" : "false",
+    socValid ? "true" : "false",
+    bmsSoc,
     packVoltage,
     cellVoltage[0],
     cellVoltage[1],
@@ -642,6 +671,72 @@ void updateEncoderData() {
 }
 
 // ================= BMS PARSING =================
+
+void updateSOCDataFromFullFrame(const uint8_t* frame, size_t len) {
+  if (len < JK_MIN_FRAME_SIZE) return;
+
+  bool isRealtimeFrame =
+    frame[0] == 0x55 &&
+    frame[1] == 0xAA &&
+    frame[2] == 0xEB &&
+    frame[3] == 0x90 &&
+    frame[4] == 0x02;
+
+  if (!isRealtimeFrame) return;
+
+  // Pada protokol JK-BMS ini CRC frame 300 byte berada di index 299.
+  // Frame yang CRC-nya gagal diabaikan supaya SoC tidak random.
+  uint8_t computedCRC = calcJKCRC(frame, JK_MIN_FRAME_SIZE - 1);
+  uint8_t remoteCRC = frame[JK_MIN_FRAME_SIZE - 1];
+
+  if (computedCRC != remoteCRC) {
+    Serial.print("CRC SoC frame gagal: computed=0x");
+    Serial.print(computedCRC, HEX);
+    Serial.print(" remote=0x");
+    Serial.println(remoteCRC, HEX);
+    return;
+  }
+
+  uint8_t rawSoc = frame[JK_SOC_BYTE_INDEX];
+
+  // SoC normal berada pada rentang 0-100%.
+  if (rawSoc <= 100) {
+    bmsSoc = rawSoc;
+    socValid = true;
+    lastBMSDataTime = millis();
+  } else {
+    socValid = false;
+  }
+}
+
+void assembleBMSFrameForSOC(uint8_t* data, size_t len) {
+  if (len == 0) return;
+
+  bool hasHeader =
+    len >= 4 &&
+    data[0] == 0x55 &&
+    data[1] == 0xAA &&
+    data[2] == 0xEB &&
+    data[3] == 0x90;
+
+  // Header response JK-BMS menandai awal frame baru.
+  if (hasHeader) {
+    bmsFrameBuffer.clear();
+  }
+
+  // Jika buffer terlalu panjang, kemungkinan frame sudah geser/korup.
+  if (bmsFrameBuffer.size() + len > JK_MAX_FRAME_SIZE) {
+    bmsFrameBuffer.clear();
+  }
+
+  bmsFrameBuffer.insert(bmsFrameBuffer.end(), data, data + len);
+
+  if (bmsFrameBuffer.size() >= JK_MIN_FRAME_SIZE) {
+    updateSOCDataFromFullFrame(bmsFrameBuffer.data(), bmsFrameBuffer.size());
+    bmsFrameBuffer.clear();
+  }
+}
+
 void updateVoltageData(uint8_t* data, size_t len) {
   if (len < 6 + CELL_COUNT * 2) return;
 
@@ -920,6 +1015,14 @@ void printDataForControl() {
   Serial.print("BMS Timeout            : ");
   Serial.println(isBMSTimeout() ? "YES" : "NO");
 
+  if (socValid) {
+    Serial.print("SoC Baterai            : ");
+    Serial.print(bmsSoc, 1);
+    Serial.println(" %");
+  } else {
+    Serial.println("SoC Baterai            : belum valid");
+  }
+
   if (voltageValid) {
     Serial.print("Tegangan Total Baterai : ");
     Serial.print(packVoltage, 3);
@@ -1035,6 +1138,10 @@ void printDataForControl() {
 
 // ================= BLE CALLBACK =================
 void parseNotify(uint8_t* data, size_t len) {
+  // Protokol baru untuk SoC: gabungkan notification BLE sampai full frame 300 byte,
+  // lalu baca SoC dari byte 173.
+  assembleBMSFrameForSOC(data, len);
+
   if (len < 20) return;
 
   bool isVoltageFrame =
@@ -1219,6 +1326,8 @@ void loop() {
     }
   } else {
     systemMode = MODE_SAFE_OFF;
+    socValid = false;
+    bmsFrameBuffer.clear();
     allRelayOff();
 
     Serial.println("BMS disconnected. Relay OFF. Restart ESP32 or improve BLE connection.");
