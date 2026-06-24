@@ -775,7 +775,7 @@ void setup() {
   setupIna219();
   setupAdxl345();
 
-  ESP32Encoder::useInternalWeakPullResistors = UP;
+  ESP32Encoder::useInternalWeakPullResistors = puType::none;
   encoder.attachFullQuad(ENCODER_A_PIN, ENCODER_B_PIN);
   resetEncoderPosition();
 
