@@ -378,7 +378,6 @@ void updateIna219Sensors() {
     phaseWShuntMv = phaseWVoltageAvg = phaseWCurrentAvg = phaseWPowerAvg = 0.0;
   }
 
-  // Bagian yang diminta dosen:
   // Vuv, Vuw, Vvw diambil dari selisih tegangan rata-rata per fasa.
   // abs() dipakai agar nilai tegangan antar fasa selalu positif di dashboard.
   vuvVoltageAvg = fabs(phaseUVoltageAvg - phaseVVoltageAvg);
@@ -608,6 +607,7 @@ void maintainMQTT() {
   }
 }
 
+//format JSON sebagai payload data ke MQTT
 void publishMotorData() {
   if (!mqttClient.connected()) return;
 
@@ -720,6 +720,7 @@ void publishMotorData() {
   Serial.println(ok ? "OK" : "FAILED");
 }
 
+//print serial monitor
 void printMotorData() {
   Serial.println();
   Serial.println("===== ESP2 MOTOR + DST-WLTC =====");
