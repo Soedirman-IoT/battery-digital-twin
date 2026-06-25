@@ -8,6 +8,19 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
 
+// =====================================================
+// ESP2 - MOTOR + DST-WLTC CONTROLLER
+// 1) Subscribe perintah dari ESP1: skripsi/motor01/cmd
+// 2) Kontrol speed BLDC via X9C103S
+// 3) Baca RPM + posisi encoder
+// 4) Baca 3 INA219 pada fasa U/V/W:
+//    - iu, iv, iw dari current INA219
+//    - Vu, Vv, Vw dari bus/load voltage INA219
+//    - Vuv, Vuw, Vvw dihitung dari selisih Vu/Vv/Vw
+// 5) Baca suhu LM35 dan vibrasi ADXL345
+// 6) Publish MQTT untuk dashboard + database
+// =====================================================
+
 // ================= WIFI WPA2 ENTERPRISE + MQTT CONFIG =================
 const char* WIFI_SSID = "eduroam";
 
@@ -43,11 +56,9 @@ unsigned long lastMotorCmdTime = 0;
 const int X9C_CS_PIN  = 18;
 const int X9C_INC_PIN = 19;
 const int X9C_UD_PIN  = 21;
-
 const bool POT_STEP_HIGHER_MEANS_HIGHER_SPEED = false;
 const int POT_MIN_STEP = 0;
 const int POT_MAX_STEP = 99;
-
 int currentPotStep = 0;
 int targetPotStep = 0;
 
@@ -62,10 +73,8 @@ const int QUAD_MULTIPLIER = 4;
 const int ENCODER_COUNTS_PER_REV = PPR * QUAD_MULTIPLIER;
 
 ESP32Encoder encoder;
-
 long lastEncoderCount = 0;
 unsigned long lastRpmCalcMs = 0;
-
 float rpmMeasured = 0.0;
 float rpmFiltered = 0.0;
 const float RPM_FILTER_ALPHA = 0.25;
@@ -79,6 +88,7 @@ float totalRevolution = 0.0;
 const int I2C_SDA_PIN = 23;
 const int I2C_SCL_PIN = 22;
 
+// Pastikan address INA219 berbeda via jumper A0/A1.
 const uint8_t INA219_U_ADDR = 0x40;
 const uint8_t INA219_V_ADDR = 0x41;
 const uint8_t INA219_W_ADDR = 0x44;
@@ -91,10 +101,13 @@ bool ina219UReady = false;
 bool ina219VReady = false;
 bool ina219WReady = false;
 
+// Tegangan per fasa terhadap referensi/common yang sama.
+// Data ini dipakai untuk menghitung estimasi tegangan antar fasa.
 float phaseUVoltageAvg = 0.0;
 float phaseVVoltageAvg = 0.0;
 float phaseWVoltageAvg = 0.0;
 
+// Arus line per fasa.
 float phaseUCurrentAvg = 0.0;
 float phaseVCurrentAvg = 0.0;
 float phaseWCurrentAvg = 0.0;
@@ -108,29 +121,21 @@ float phaseUShuntMv = 0.0;
 float phaseVShuntMv = 0.0;
 float phaseWShuntMv = 0.0;
 
+// Tegangan antar fasa hasil perhitungan selisih.
+// Ini bukan differential measurement langsung, melainkan estimasi nilai rata-rata.
 float vuvVoltageAvg = 0.0;
 float vuwVoltageAvg = 0.0;
 float vvwVoltageAvg = 0.0;
 
-// ================= LM35 CONFIG - SUDAH DIPERBAIKI =================
-const int LM35_PIN = 32;              // ADC1, aman saat WiFi aktif
+// LM35 = 10 mV/°C. Gunakan ADC1 karena WiFi aktif.
+const int LM35_PIN = 32;
 const float ADC_REF_V = 3.30;
 const float ADC_MAX_COUNT = 4095.0;
-
-const int LM35_SAMPLE_COUNT = 100;    // sebelumnya 20
-const float TEMP_FILTER_ALPHA = 0.10; // makin kecil = makin halus
-
+const int LM35_SAMPLE_COUNT = 50;
 float motorDcTempC = 0.0;
-float motorDcTempRawC = 0.0;
-float motorDcTempFilteredC = 25.0;
-float lm35Voltage = 0.0;
-float lm35RawAdc = 0.0;
 
-// ================= ADXL345 CONFIG =================
 Adafruit_ADXL345_Unified adxl = Adafruit_ADXL345_Unified(12345);
-
 bool adxlReady = false;
-
 float accelX = 0.0;
 float accelY = 0.0;
 float accelZ = 0.0;
@@ -138,7 +143,6 @@ float accelMagnitude = 0.0;
 float vibrationRms = 0.0;
 float vibrationPeak = 0.0;
 float accelMagnitudeBaseline = 9.81;
-
 const float VIBRATION_BASELINE_ALPHA = 0.01;
 
 // ================= WLTC / DST PROFILE CONFIG =================
@@ -161,18 +165,15 @@ const WltcPoint WLTC_PROFILE[] = {
   {1480,0},{1510,72},{1530,60},{1550,98},{1570,124},{1600,106},{1625,116},{1645,104},{1670,126},{1700,128},
   {1725,131},{1750,90},{1775,60},{1800,0}
 };
-
 const int WLTC_POINT_COUNT = sizeof(WLTC_PROFILE) / sizeof(WLTC_PROFILE[0]);
 
 // ================= COMMAND STATE FROM ESP1 =================
 bool motorEnableFromEsp1 = false;
 bool batterySafeFromEsp1 = false;
-
 String loadStage = "REST";
 String esp1SystemMode = "UNKNOWN";
 
 bool motorActuallyEnabled = false;
-
 float wltcSpeedKmh = 0.0;
 float rpmSetpoint = 0.0;
 unsigned long wltcSecond = 0;
@@ -217,63 +218,48 @@ bool extractJsonBool(const String& src, const String& key, bool fallback) {
 
   String tail = src.substring(colon + 1);
   tail.trim();
-
   if (tail.startsWith("true")) return true;
   if (tail.startsWith("false")) return false;
-
   return fallback;
 }
 
 void setMotorEnablePin(bool on) {
   motorActuallyEnabled = on;
-
   if (MOTOR_ENABLE_PIN < 0) return;
-
-  digitalWrite(
-    MOTOR_ENABLE_PIN,
-    MOTOR_ENABLE_ACTIVE_HIGH ? (on ? HIGH : LOW) : (on ? LOW : HIGH)
-  );
+  digitalWrite(MOTOR_ENABLE_PIN, MOTOR_ENABLE_ACTIVE_HIGH ? (on ? HIGH : LOW) : (on ? LOW : HIGH));
 }
 
 // ================= X9C103S CONTROL =================
 void x9cPulseInc() {
   digitalWrite(X9C_INC_PIN, HIGH);
   delayMicroseconds(5);
-
   digitalWrite(X9C_INC_PIN, LOW);
   delayMicroseconds(5);
-
   digitalWrite(X9C_INC_PIN, HIGH);
   delayMicroseconds(5);
 }
 
 void x9cMoveOneStep(bool increaseStep) {
   bool udHigh = POT_STEP_HIGHER_MEANS_HIGHER_SPEED ? increaseStep : !increaseStep;
-
   digitalWrite(X9C_UD_PIN, udHigh ? HIGH : LOW);
   delayMicroseconds(5);
-
   x9cPulseInc();
 }
 
 void x9cSetStep(int step) {
   step = clampInt(step, POT_MIN_STEP, POT_MAX_STEP);
-
   if (step == currentPotStep) return;
 
   digitalWrite(X9C_CS_PIN, LOW);
   delayMicroseconds(5);
-
   while (currentPotStep < step) {
     x9cMoveOneStep(true);
     currentPotStep++;
   }
-
   while (currentPotStep > step) {
     x9cMoveOneStep(false);
     currentPotStep--;
   }
-
   digitalWrite(X9C_CS_PIN, HIGH);
   delay(10);
 }
@@ -281,38 +267,27 @@ void x9cSetStep(int step) {
 void x9cResetToZero() {
   digitalWrite(X9C_CS_PIN, LOW);
   delayMicroseconds(5);
-
-  for (int i = 0; i < 110; i++) {
-    x9cMoveOneStep(false);
-  }
-
+  for (int i = 0; i < 110; i++) x9cMoveOneStep(false);
   digitalWrite(X9C_CS_PIN, HIGH);
   delay(10);
-
   currentPotStep = POT_MIN_STEP;
 }
 
 // ================= WLTC PROFILE =================
 float interpolateWltcSpeed(unsigned long secInCycle) {
-  if (secInCycle >= WLTC_CYCLE_SECONDS) {
-    secInCycle %= WLTC_CYCLE_SECONDS;
-  }
+  if (secInCycle >= WLTC_CYCLE_SECONDS) secInCycle %= WLTC_CYCLE_SECONDS;
 
   for (int i = 0; i < WLTC_POINT_COUNT - 1; i++) {
     uint16_t t0 = WLTC_PROFILE[i].t;
     uint16_t t1 = WLTC_PROFILE[i + 1].t;
-
     if (secInCycle >= t0 && secInCycle <= t1) {
       float v0 = WLTC_PROFILE[i].v;
       float v1 = WLTC_PROFILE[i + 1].v;
-
       if (t1 == t0) return v1;
-
       float ratio = (float)(secInCycle - t0) / (float)(t1 - t0);
       return v0 + ratio * (v1 - v0);
     }
   }
-
   return 0.0;
 }
 
@@ -323,18 +298,13 @@ float mapSpeedToRpm(float speedKmh) {
 
 int mapRpmToPotStep(float rpm) {
   rpm = clampFloat(rpm, MOTOR_MIN_RPM, MOTOR_MAX_RPM);
-
   float ratio = rpm / MOTOR_MAX_RPM;
   int step = round(POT_MIN_STEP + ratio * (POT_MAX_STEP - POT_MIN_STEP));
-
   return clampInt(step, POT_MIN_STEP, POT_MAX_STEP);
 }
 
 void updateWltcControl() {
-  bool cmdTimeout =
-    (lastMotorCmdTime == 0) ||
-    (millis() - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS);
-
+  bool cmdTimeout = (lastMotorCmdTime == 0) || (millis() - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS);
   bool allowedByEsp1 =
     !cmdTimeout &&
     motorEnableFromEsp1 &&
@@ -346,19 +316,16 @@ void updateWltcControl() {
     wltcSpeedKmh = 0.0;
     rpmSetpoint = 0.0;
     targetPotStep = POT_MIN_STEP;
-
     setMotorEnablePin(false);
     x9cSetStep(targetPotStep);
     return;
   }
 
   setMotorEnablePin(true);
-
   wltcSecond = (millis() / 1000UL) % WLTC_CYCLE_SECONDS;
   wltcSpeedKmh = interpolateWltcSpeed(wltcSecond);
   rpmSetpoint = mapSpeedToRpm(wltcSpeedKmh);
   targetPotStep = mapRpmToPotStep(rpmSetpoint);
-
   x9cSetStep(targetPotStep);
 }
 
@@ -372,14 +339,15 @@ void setupIna219() {
   if (ina219VReady) ina219V.setCalibration_32V_2A();
   if (ina219WReady) ina219W.setCalibration_32V_2A();
 
-  Serial.print("INA219 U: ");
-  Serial.println(ina219UReady ? "OK" : "NOT FOUND");
+  Serial.print("INA219 U: "); Serial.println(ina219UReady ? "OK" : "NOT FOUND");
+  Serial.print("INA219 V: "); Serial.println(ina219VReady ? "OK" : "NOT FOUND");
+  Serial.print("INA219 W: "); Serial.println(ina219WReady ? "OK" : "NOT FOUND");
+}
 
-  Serial.print("INA219 V: ");
-  Serial.println(ina219VReady ? "OK" : "NOT FOUND");
-
-  Serial.print("INA219 W: ");
-  Serial.println(ina219WReady ? "OK" : "NOT FOUND");
+float readInaLoadVoltage(Adafruit_INA219& sensor) {
+  float shuntMv = sensor.getShuntVoltage_mV();
+  float busV = sensor.getBusVoltage_V();
+  return busV + (shuntMv / 1000.0);
 }
 
 void updateIna219Sensors() {
@@ -389,10 +357,7 @@ void updateIna219Sensors() {
     phaseUCurrentAvg = ina219U.getCurrent_mA() / 1000.0;
     phaseUPowerAvg = phaseUVoltageAvg * phaseUCurrentAvg;
   } else {
-    phaseUShuntMv = 0.0;
-    phaseUVoltageAvg = 0.0;
-    phaseUCurrentAvg = 0.0;
-    phaseUPowerAvg = 0.0;
+    phaseUShuntMv = phaseUVoltageAvg = phaseUCurrentAvg = phaseUPowerAvg = 0.0;
   }
 
   if (ina219VReady) {
@@ -401,10 +366,7 @@ void updateIna219Sensors() {
     phaseVCurrentAvg = ina219V.getCurrent_mA() / 1000.0;
     phaseVPowerAvg = phaseVVoltageAvg * phaseVCurrentAvg;
   } else {
-    phaseVShuntMv = 0.0;
-    phaseVVoltageAvg = 0.0;
-    phaseVCurrentAvg = 0.0;
-    phaseVPowerAvg = 0.0;
+    phaseVShuntMv = phaseVVoltageAvg = phaseVCurrentAvg = phaseVPowerAvg = 0.0;
   }
 
   if (ina219WReady) {
@@ -413,12 +375,12 @@ void updateIna219Sensors() {
     phaseWCurrentAvg = ina219W.getCurrent_mA() / 1000.0;
     phaseWPowerAvg = phaseWVoltageAvg * phaseWCurrentAvg;
   } else {
-    phaseWShuntMv = 0.0;
-    phaseWVoltageAvg = 0.0;
-    phaseWCurrentAvg = 0.0;
-    phaseWPowerAvg = 0.0;
+    phaseWShuntMv = phaseWVoltageAvg = phaseWCurrentAvg = phaseWPowerAvg = 0.0;
   }
 
+  // Bagian yang diminta dosen:
+  // Vuv, Vuw, Vvw diambil dari selisih tegangan rata-rata per fasa.
+  // abs() dipakai agar nilai tegangan antar fasa selalu positif di dashboard.
   vuvVoltageAvg = fabs(phaseUVoltageAvg - phaseVVoltageAvg);
   vuwVoltageAvg = fabs(phaseUVoltageAvg - phaseWVoltageAvg);
   vvwVoltageAvg = fabs(phaseVVoltageAvg - phaseWVoltageAvg);
@@ -426,94 +388,48 @@ void updateIna219Sensors() {
   phaseTotalPowerAvg = phaseUPowerAvg + phaseVPowerAvg + phaseWPowerAvg;
 }
 
-// ================= LM35 READING - VERSI DIPERBAIKI =================
-void setupLm35Sensor() {
-  pinMode(LM35_PIN, INPUT);
-
-  analogReadResolution(12);
-  analogSetPinAttenuation(LM35_PIN, ADC_11db);
-
-  // Buang pembacaan awal ADC agar lebih stabil
-  for (int i = 0; i < 30; i++) {
-    analogRead(LM35_PIN);
-    delay(2);
-  }
-
-  Serial.println("LM35 ADC initialized.");
-}
-
 void updateLm35Sensor() {
   uint32_t rawSum = 0;
-
   for (int i = 0; i < LM35_SAMPLE_COUNT; i++) {
     rawSum += analogRead(LM35_PIN);
-    delayMicroseconds(200);
+    delayMicroseconds(2000);
   }
-
-  lm35RawAdc = (float)rawSum / (float)LM35_SAMPLE_COUNT;
-
-  lm35Voltage = (lm35RawAdc / ADC_MAX_COUNT) * ADC_REF_V;
-
-  motorDcTempRawC = lm35Voltage * 100.0;
-
-  // Batasi nilai tidak masuk akal akibat noise sesaat
-  if (motorDcTempRawC < -10.0 || motorDcTempRawC > 120.0) {
-    return;
-  }
-
-  motorDcTempFilteredC =
-    (TEMP_FILTER_ALPHA * motorDcTempRawC) +
-    ((1.0 - TEMP_FILTER_ALPHA) * motorDcTempFilteredC);
-
-  motorDcTempC = motorDcTempFilteredC;
+  float rawAvg = (float)rawSum / (float)LM35_SAMPLE_COUNT;
+  float voltage = (rawAvg / ADC_MAX_COUNT) * ADC_REF_V;
+  motorDcTempC = voltage * 100.0;
 }
 
 void setupAdxl345() {
   adxlReady = adxl.begin();
-
   if (!adxlReady) {
     Serial.println("ADXL345 not detected. Check wiring/address.");
     return;
   }
-
   adxl.setRange(ADXL345_RANGE_16_G);
-
   Serial.println("ADXL345 detected and initialized.");
 }
 
 void updateAdxl345Sensor() {
   if (!adxlReady) {
-    accelX = 0.0;
-    accelY = 0.0;
-    accelZ = 0.0;
-    accelMagnitude = 0.0;
-    vibrationRms = 0.0;
-    vibrationPeak = 0.0;
+    accelX = accelY = accelZ = accelMagnitude = vibrationRms = vibrationPeak = 0.0;
     return;
   }
 
   const int sampleCount = 25;
-
   float sumSq = 0.0;
   float peak = 0.0;
-
   sensors_event_t event;
 
   for (int i = 0; i < sampleCount; i++) {
     adxl.getEvent(&event);
-
     float x = event.acceleration.x;
     float y = event.acceleration.y;
     float z = event.acceleration.z;
-
     float mag = sqrt(x * x + y * y + z * z);
     float vib = mag - accelMagnitudeBaseline;
 
     sumSq += vib * vib;
-
-    if (fabs(vib) > peak) {
-      peak = fabs(vib);
-    }
+    if (fabs(vib) > peak) peak = fabs(vib);
 
     if (i == sampleCount - 1) {
       accelX = x;
@@ -521,7 +437,6 @@ void updateAdxl345Sensor() {
       accelZ = z;
       accelMagnitude = mag;
     }
-
     delayMicroseconds(1000);
   }
 
@@ -533,37 +448,28 @@ void updateAdxl345Sensor() {
   vibrationPeak = peak;
 }
 
-// ================= ENCODER =================
 void updateEncoderPositionFromCount(long countNow) {
   encoderCountNow = countNow;
   totalRevolution = (float)encoderCountNow / (float)ENCODER_COUNTS_PER_REV;
 
   long countMod = encoderCountNow % ENCODER_COUNTS_PER_REV;
-
-  if (countMod < 0) {
-    countMod += ENCODER_COUNTS_PER_REV;
-  }
-
+  if (countMod < 0) countMod += ENCODER_COUNTS_PER_REV;
   encoderCountInOneRev = countMod;
   positionDegree = ((float)encoderCountInOneRev * 360.0) / (float)ENCODER_COUNTS_PER_REV;
 }
 
 void resetEncoderPosition() {
   encoder.clearCount();
-
   lastEncoderCount = 0;
   lastRpmCalcMs = 0;
-
   rpmMeasured = 0.0;
   rpmFiltered = 0.0;
-
   updateEncoderPositionFromCount(0);
 }
 
 void updateRpm() {
   unsigned long now = millis();
   long countNow = encoder.getCount();
-
   updateEncoderPositionFromCount(countNow);
 
   if (lastRpmCalcMs == 0) {
@@ -573,12 +479,10 @@ void updateRpm() {
   }
 
   unsigned long dt = now - lastRpmCalcMs;
-
   if (dt < 500) return;
 
   long diff = countNow - lastEncoderCount;
   float rev = (float)diff / (float)ENCODER_COUNTS_PER_REV;
-
   rpmMeasured = (rev * 60000.0) / (float)dt;
   rpmFiltered = RPM_FILTER_ALPHA * rpmMeasured + (1.0 - RPM_FILTER_ALPHA) * rpmFiltered;
 
@@ -589,7 +493,6 @@ void updateRpm() {
 bool isSlipOrLoadAnomaly() {
   if (!motorActuallyEnabled) return false;
   if (rpmSetpoint < 300.0) return false;
-
   return fabs(rpmFiltered) < (0.35 * rpmSetpoint);
 }
 
@@ -600,7 +503,6 @@ void setupWiFi() {
 
   WiFi.disconnect(true);
   delay(1000);
-
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
 
@@ -608,13 +510,10 @@ void setupWiFi() {
   esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
   esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
   esp_wifi_sta_enterprise_enable();
-
   WiFi.begin(WIFI_SSID);
 
   Serial.print("Connecting WiFi");
-
   unsigned long startAttempt = millis();
-
   while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
     Serial.print(".");
     delay(500);
@@ -632,14 +531,10 @@ void setupWiFi() {
 
 void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
-
   unsigned long now = millis();
-
   if (now - lastWifiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
     lastWifiReconnectAttempt = now;
-
     Serial.println("Reconnecting WiFi...");
-
     WiFi.disconnect(false);
     delay(500);
     WiFi.begin(WIFI_SSID);
@@ -650,13 +545,8 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (String(topic) != MQTT_TOPIC_MOTOR_CMD) return;
 
   char msg[512];
-
   unsigned int copyLen = length;
-
-  if (copyLen >= sizeof(msg)) {
-    copyLen = sizeof(msg) - 1;
-  }
-
+  if (copyLen >= sizeof(msg)) copyLen = sizeof(msg) - 1;
   memcpy(msg, payload, copyLen);
   msg[copyLen] = '\0';
 
@@ -665,10 +555,8 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   motorEnableFromEsp1 = extractJsonBool(command, "motor_enable", motorEnableFromEsp1);
   batterySafeFromEsp1 = extractJsonBool(command, "battery_safe", batterySafeFromEsp1);
-
   loadStage = extractJsonString(command, "load_stage", loadStage);
   esp1SystemMode = extractJsonString(command, "system_mode", esp1SystemMode);
-
   loadStage.toUpperCase();
   esp1SystemMode.toUpperCase();
 
@@ -678,7 +566,6 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   lastMotorCmdTime = millis();
-
   Serial.println("MQTT CMD from ESP1:");
   Serial.println(command);
 }
@@ -691,20 +578,16 @@ void setupMQTT() {
 
 void maintainMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
-
   if (mqttClient.connected()) {
     mqttClient.loop();
     return;
   }
 
   unsigned long now = millis();
-
   if (now - lastMqttReconnectAttempt < MQTT_RECONNECT_INTERVAL_MS) return;
-
   lastMqttReconnectAttempt = now;
 
   Serial.print("Connecting MQTT... ");
-
   bool connected = mqttClient.connect(
     MQTT_CLIENT_ID,
     MQTT_USERNAME,
@@ -717,7 +600,6 @@ void maintainMQTT() {
 
   if (connected) {
     Serial.println("connected.");
-
     mqttClient.publish(MQTT_TOPIC_MOTOR_STATUS, "online", true);
     mqttClient.subscribe(MQTT_TOPIC_MOTOR_CMD);
   } else {
@@ -730,17 +612,12 @@ void publishMotorData() {
   if (!mqttClient.connected()) return;
 
   unsigned long now = millis();
-
   if (now - lastMqttPublish < MQTT_PUBLISH_INTERVAL_MS) return;
-
   lastMqttPublish = now;
 
-  bool cmdTimeout =
-    (lastMotorCmdTime == 0) ||
-    (now - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS);
+  bool cmdTimeout = (lastMotorCmdTime == 0) || (now - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS);
 
-  char payload[3000];
-
+  char payload[2600];
   snprintf(
     payload,
     sizeof(payload),
@@ -781,9 +658,6 @@ void publishMotorData() {
       "\"vuv_voltage_avg\":%.3f,"
       "\"vuw_voltage_avg\":%.3f,"
       "\"vvw_voltage_avg\":%.3f,"
-      "\"lm35_raw_adc\":%.1f,"
-      "\"lm35_voltage\":%.4f,"
-      "\"motor_dc_temp_raw_c\":%.2f,"
       "\"motor_dc_temp_c\":%.2f,"
       "\"adxl_ready\":%s,"
       "\"accel_x\":%.3f,"
@@ -830,9 +704,6 @@ void publishMotorData() {
     vuvVoltageAvg,
     vuwVoltageAvg,
     vvwVoltageAvg,
-    lm35RawAdc,
-    lm35Voltage,
-    motorDcTempRawC,
     motorDcTempC,
     adxlReady ? "true" : "false",
     accelX,
@@ -845,7 +716,6 @@ void publishMotorData() {
   );
 
   bool ok = mqttClient.publish(MQTT_TOPIC_MOTOR_DATA, payload, false);
-
   Serial.print("MQTT motor publish: ");
   Serial.println(ok ? "OK" : "FAILED");
 }
@@ -853,102 +723,30 @@ void publishMotorData() {
 void printMotorData() {
   Serial.println();
   Serial.println("===== ESP2 MOTOR + DST-WLTC =====");
-
-  Serial.print("WiFi                  : ");
-  Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
-
-  Serial.print("MQTT                  : ");
-  Serial.println(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED");
-
-  Serial.print("Motor CMD Timeout     : ");
-  Serial.println(((lastMotorCmdTime == 0) || (millis() - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS)) ? "YES" : "NO");
-
-  Serial.print("ESP1 Motor Enable     : ");
-  Serial.println(motorEnableFromEsp1 ? "YES" : "NO");
-
-  Serial.print("ESP1 Battery Safe     : ");
-  Serial.println(batterySafeFromEsp1 ? "YES" : "NO");
-
-  Serial.print("Load Stage            : ");
-  Serial.println(loadStage);
-
-  Serial.print("ESP1 System Mode      : ");
-  Serial.println(esp1SystemMode);
-
-  Serial.print("Motor Actually Enabled: ");
-  Serial.println(motorActuallyEnabled ? "YES" : "NO");
-
-  Serial.print("WLTC Second           : ");
-  Serial.println(wltcSecond);
-
-  Serial.print("WLTC Speed            : ");
-  Serial.print(wltcSpeedKmh, 2);
-  Serial.println(" km/h");
-
-  Serial.print("RPM Setpoint          : ");
-  Serial.println(rpmSetpoint, 1);
-
-  Serial.print("Pot Step              : ");
-  Serial.println(currentPotStep);
-
-  Serial.print("RPM Filtered          : ");
-  Serial.println(rpmFiltered, 1);
-
-  Serial.print("Position Degree       : ");
-  Serial.print(positionDegree, 2);
-  Serial.println(" deg");
+  Serial.print("WiFi                  : "); Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+  Serial.print("MQTT                  : "); Serial.println(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED");
+  Serial.print("Motor CMD Timeout     : "); Serial.println(((lastMotorCmdTime == 0) || (millis() - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS)) ? "YES" : "NO");
+  Serial.print("ESP1 Motor Enable     : "); Serial.println(motorEnableFromEsp1 ? "YES" : "NO");
+  Serial.print("ESP1 Battery Safe     : "); Serial.println(batterySafeFromEsp1 ? "YES" : "NO");
+  Serial.print("Load Stage            : "); Serial.println(loadStage);
+  Serial.print("ESP1 System Mode      : "); Serial.println(esp1SystemMode);
+  Serial.print("Motor Actually Enabled: "); Serial.println(motorActuallyEnabled ? "YES" : "NO");
+  Serial.print("WLTC Second           : "); Serial.println(wltcSecond);
+  Serial.print("WLTC Speed            : "); Serial.print(wltcSpeedKmh, 2); Serial.println(" km/h");
+  Serial.print("RPM Setpoint          : "); Serial.println(rpmSetpoint, 1);
+  Serial.print("Pot Step              : "); Serial.println(currentPotStep);
+  Serial.print("RPM Filtered          : "); Serial.println(rpmFiltered, 1);
+  Serial.print("Position Degree       : "); Serial.print(positionDegree, 2); Serial.println(" deg");
 
   Serial.println("--- INA219 phase average data ---");
+  Serial.print("Vu/Vv/Vw              : "); Serial.print(phaseUVoltageAvg, 3); Serial.print(" / "); Serial.print(phaseVVoltageAvg, 3); Serial.print(" / "); Serial.println(phaseWVoltageAvg, 3);
+  Serial.print("iu/iv/iw              : "); Serial.print(phaseUCurrentAvg, 3); Serial.print(" / "); Serial.print(phaseVCurrentAvg, 3); Serial.print(" / "); Serial.println(phaseWCurrentAvg, 3);
+  Serial.print("Vuv/Vuw/Vvw           : "); Serial.print(vuvVoltageAvg, 3); Serial.print(" / "); Serial.print(vuwVoltageAvg, 3); Serial.print(" / "); Serial.println(vvwVoltageAvg, 3);
+  Serial.print("Ptotal avg            : "); Serial.print(phaseTotalPowerAvg, 3); Serial.println(" W");
 
-  Serial.print("Vu/Vv/Vw              : ");
-  Serial.print(phaseUVoltageAvg, 3);
-  Serial.print(" / ");
-  Serial.print(phaseVVoltageAvg, 3);
-  Serial.print(" / ");
-  Serial.println(phaseWVoltageAvg, 3);
-
-  Serial.print("iu/iv/iw              : ");
-  Serial.print(phaseUCurrentAvg, 3);
-  Serial.print(" / ");
-  Serial.print(phaseVCurrentAvg, 3);
-  Serial.print(" / ");
-  Serial.println(phaseWCurrentAvg, 3);
-
-  Serial.print("Vuv/Vuw/Vvw           : ");
-  Serial.print(vuvVoltageAvg, 3);
-  Serial.print(" / ");
-  Serial.print(vuwVoltageAvg, 3);
-  Serial.print(" / ");
-  Serial.println(vvwVoltageAvg, 3);
-
-  Serial.print("Ptotal avg            : ");
-  Serial.print(phaseTotalPowerAvg, 3);
-  Serial.println(" W");
-
-  Serial.println("--- LM35 data ---");
-
-  Serial.print("LM35 Raw ADC          : ");
-  Serial.println(lm35RawAdc, 1);
-
-  Serial.print("LM35 Voltage          : ");
-  Serial.print(lm35Voltage, 4);
-  Serial.println(" V");
-
-  Serial.print("LM35 Temp Raw         : ");
-  Serial.print(motorDcTempRawC, 2);
-  Serial.println(" C");
-
-  Serial.print("LM35 Temp Filtered    : ");
-  Serial.print(motorDcTempC, 2);
-  Serial.println(" C");
-
-  Serial.print("Vibration RMS         : ");
-  Serial.print(vibrationRms, 4);
-  Serial.println(" m/s^2");
-
-  Serial.print("Slip/Load Anomaly     : ");
-  Serial.println(isSlipOrLoadAnomaly() ? "YES" : "NO");
-
+  Serial.print("Motor DC Temp LM35    : "); Serial.print(motorDcTempC, 2); Serial.println(" C");
+  Serial.print("Vibration RMS         : "); Serial.print(vibrationRms, 4); Serial.println(" m/s^2");
+  Serial.print("Slip/Load Anomaly     : "); Serial.println(isSlipOrLoadAnomaly() ? "YES" : "NO");
   Serial.println("=================================");
 }
 
@@ -960,7 +758,6 @@ void setup() {
   pinMode(X9C_CS_PIN, OUTPUT);
   pinMode(X9C_INC_PIN, OUTPUT);
   pinMode(X9C_UD_PIN, OUTPUT);
-
   digitalWrite(X9C_CS_PIN, HIGH);
   digitalWrite(X9C_INC_PIN, HIGH);
   digitalWrite(X9C_UD_PIN, LOW);
@@ -970,10 +767,11 @@ void setup() {
     setMotorEnablePin(false);
   }
 
-  setupLm35Sensor();
+  pinMode(LM35_PIN, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(LM35_PIN, ADC_11db);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-
   setupIna219();
   setupAdxl345();
 
@@ -983,10 +781,9 @@ void setup() {
 
   x9cResetToZero();
 
-  Serial.println("ESP2 MOTOR CONTROLLER - DST-WLTC + X9C103S + 3xINA219 + LM35 FILTERED + ADXL345 + MQTT");
+  Serial.println("ESP2 MOTOR CONTROLLER - DST-WLTC + X9C103S + 3xINA219 + LM35 + ADXL345 + MQTT");
 
   wifiClient.setInsecure();
-
   setupWiFi();
   setupMQTT();
 }
@@ -1003,7 +800,6 @@ void loop() {
 
   if (now - lastSensor >= 200) {
     lastSensor = now;
-
     updateRpm();
     updateIna219Sensors();
     updateLm35Sensor();
