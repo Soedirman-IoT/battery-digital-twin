@@ -8,3 +8,6 @@ isian kode buat project penelitian digital battery twin
 
 # Rangkaian
 <img width="1032" height="1829" alt="IMG20260607140405" src="https://github.com/user-attachments/assets/312c5a97-4060-4eab-9e88-ac81b203ca5c" />
+
+# Rangkaian 1.1
+<img width="1811" height="1021" alt="IMG20260625183324" src="https://github.com/user-attachments/assets/abd49ea8-d382-4329-a2db-a66d5834b803" />
