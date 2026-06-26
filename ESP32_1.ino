@@ -202,7 +202,7 @@ bool tempValid = false;
 
 // ================= SAFETY TIMEOUT =================
 unsigned long lastBMSDataTime = 0;
-const unsigned long BMS_TIMEOUT_MS = 10000;
+const unsigned long BMS_TIMEOUT_MS = 60000;
 
 // ================= RELAY STATE =================
 bool loadRelayOn = false;
