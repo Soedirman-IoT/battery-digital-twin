@@ -225,7 +225,7 @@ const float CHARGE_START_CELL_V = 3.10;
 const float CHARGE_STOP_CELL_V  = 4.15;
 
 const float PACK_CHARGE_START_V = 18.6;
-const float PACK_CHARGE_STOP_V  = 24.6;
+const float PACK_CHARGE_STOP_V  = 24.9;
 
 const float TEMP_OFF_C = 55.0;
 
