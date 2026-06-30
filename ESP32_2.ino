@@ -39,6 +39,8 @@ const char* MQTT_TOPIC_MOTOR_CMD    = "skripsi/motor01/cmd";
 const char* MQTT_TOPIC_MOTOR_DATA   = "skripsi/motor01/data";
 const char* MQTT_TOPIC_MOTOR_STATUS = "skripsi/motor01/status";
 
+unsigned long wifiDisconnectedSince = 0;
+const unsigned long WIFI_RESTART_TIMEOUT_MS = 120000; // 2 menit
 const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
@@ -392,11 +394,11 @@ void updateLm35Sensor() {
   uint32_t rawSum = 0;
   for (int i = 0; i < LM35_SAMPLE_COUNT; i++) {
     rawSum += analogRead(LM35_PIN);
-    delayMicroseconds(2000);
+    delayMicroseconds(5000);
   }
   float rawAvg = (float)rawSum / (float)LM35_SAMPLE_COUNT;
   float voltage = (rawAvg / ADC_MAX_COUNT) * ADC_REF_V;
-  motorDcTempC = voltage * 100.0;
+  motorDcTempC = (voltage * 100.0) + 16;
 }
 
 void setupAdxl345() {
@@ -530,14 +532,55 @@ void setupWiFi() {
 }
 
 void maintainWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+
+  // Jika WiFi sudah tersambung
+  if (WiFi.status() == WL_CONNECTED) {
+
+    wifiDisconnectedSince = 0;
+    return;
+  }
+
+  // Catat kapan mulai disconnect
+  if (wifiDisconnectedSince == 0) {
+    wifiDisconnectedSince = millis();
+    Serial.println("WiFi disconnected!");
+  }
+
   unsigned long now = millis();
+
+  // Coba reconnect setiap 5 detik
   if (now - lastWifiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
+
     lastWifiReconnectAttempt = now;
+
     Serial.println("Reconnecting WiFi...");
-    WiFi.disconnect(false);
+
+    WiFi.disconnect(true);
     delay(500);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+
+    // Konfigurasi ulang WPA2 Enterprise
+    esp_eap_client_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+    esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+    esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+    esp_wifi_sta_enterprise_enable();
+
     WiFi.begin(WIFI_SSID);
+  }
+
+  // Sudah gagal reconnect lebih dari 2 menit?
+  if (now - wifiDisconnectedSince >= WIFI_RESTART_TIMEOUT_MS) {
+
+    Serial.println("==================================");
+    Serial.println("WiFi reconnect timeout!");
+    Serial.println("Restarting ESP32...");
+    Serial.println("==================================");
+
+    delay(1000);
+
+    ESP.restart();
   }
 }
 
