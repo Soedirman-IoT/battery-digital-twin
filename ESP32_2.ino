@@ -38,6 +38,7 @@ const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
 const char* MQTT_TOPIC_MOTOR_CMD    = "skripsi/motor01/cmd";
 const char* MQTT_TOPIC_MOTOR_DATA   = "skripsi/motor01/data";
 const char* MQTT_TOPIC_MOTOR_STATUS = "skripsi/motor01/status";
+const char* MQTT_TOPIC_MEASUREMENT_STREAM = "measurement_stream";
 
 unsigned long wifiDisconnectedSince = 0;
 const unsigned long WIFI_RESTART_TIMEOUT_MS = 120000; // 2 menit
@@ -128,6 +129,10 @@ float phaseWShuntMv = 0.0;
 float vuvVoltageAvg = 0.0;
 float vuwVoltageAvg = 0.0;
 float vvwVoltageAvg = 0.0;
+
+String motorCondition = "NORMAL";
+// ambang perbedaan arus (A)
+const float CURRENT_FAULT_THRESHOLD = 0.5;
 
 // LM35 = 10 mV/°C. Gunakan ADC1 karena WiFi aktif.
 const int LM35_PIN = 32;
@@ -388,6 +393,34 @@ void updateIna219Sensors() {
   vvwVoltageAvg = fabs(phaseVVoltageAvg - phaseWVoltageAvg);
 
   phaseTotalPowerAvg = phaseUPowerAvg + phaseVPowerAvg + phaseWPowerAvg;
+}
+
+void updateMotorCondition() {
+
+  float c_u = phaseUCurrentAvg;
+  float c_v = phaseVCurrentAvg;
+  float c_w = phaseWCurrentAvg;
+
+  if ((c_u - c_v) > CURRENT_FAULT_THRESHOLD) {
+
+    motorCondition = "UV Fault";
+
+  }
+  else if ((c_v - c_w) > CURRENT_FAULT_THRESHOLD) {
+
+    motorCondition = "VW Fault";
+
+  }
+  else if ((c_w - c_u) > CURRENT_FAULT_THRESHOLD) {
+
+    motorCondition = "WU Fault";
+
+  }
+  else {
+
+    motorCondition = "NORMAL";
+
+  }
 }
 
 void updateLm35Sensor() {
@@ -765,6 +798,44 @@ void publishMotorData() {
   bool ok = mqttClient.publish(MQTT_TOPIC_MOTOR_DATA, payload, false);
   Serial.print("MQTT motor publish: ");
   Serial.println(ok ? "OK" : "FAILED");
+
+  char measurementPayload[512];
+  snprintf(
+    measurementPayload,
+    sizeof(measurementPayload),
+    "{"
+      "\"timestamp\":%lu,"
+      "\"motor_condition\":\"%s\","
+      "\"speed\":%.1f,"
+      "\"temperature\":%.2f,"
+      "\"current_u\":%.3f,"
+      "\"current_v\":%.3f,"
+      "\"current_w\":%.3f,"
+      "\"voltage_u\":%.3f,"
+      "\"voltage_v\":%.3f,"
+      "\"voltage_w\":%.3f,"
+      "\"vibration_x\":%.3f,"
+      "\"vibration_y\":%.3f,"
+      "\"vibration_z\":%.3f"
+    "}",
+    millis(),
+    motorCondition.c_str(),
+    rpmFiltered,
+    motorDcTempC,
+    phaseUCurrentAvg,
+    phaseVCurrentAvg,
+    phaseWCurrentAvg,
+    phaseUVoltageAvg,
+    phaseVVoltageAvg,
+    phaseWVoltageAvg,
+    accelX,
+    accelY,
+    accelZ
+  );
+
+  bool ok2 = mqttClient.publish(MQTT_TOPIC_MEASUREMENT_STREAM, measurementPayload, false);
+  Serial.print("MQTT MEASUREMENT_STREAM publish: ");
+  Serial.println(ok ? "OK" : "FAILED");
 }
 
 void printMotorData() {
@@ -849,6 +920,7 @@ void loop() {
     lastSensor = now;
     updateRpm();
     updateIna219Sensors();
+    updateMotorCondition();
     updateLm35Sensor();
     updateAdxl345Sensor();
   }
