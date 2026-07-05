@@ -224,10 +224,10 @@ SystemMode systemMode = MODE_SAFE_OFF;
 
 // ================= LIMIT TEGANGAN =================
 const float CHARGE_START_CELL_V = 3.0;
-const float CHARGE_STOP_CELL_V  = 4.15;
+const float CHARGE_STOP_CELL_V  = 4.2;
 
 const float PACK_CHARGE_START_V = 18;
-const float PACK_CHARGE_STOP_V  = 24.9;
+const float PACK_CHARGE_STOP_V  = 25.2;
 
 const float TEMP_OFF_C = 55.0;
 
