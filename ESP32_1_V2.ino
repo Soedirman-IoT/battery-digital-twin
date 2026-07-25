@@ -235,7 +235,7 @@ enum SystemMode {
 SystemMode systemMode = MODE_SAFE_OFF;
 
 // ================= LIMIT SOC =================
-const float CHARGE_START_SOC = 20.0;   // mulai charge saat SoC <=20%
+const float CHARGE_START_SOC = 25.0;   // mulai charge saat SoC <=20%
 const float CHARGE_STOP_SOC  = 95.0;   // berhenti charge saat SoC >=95%
 
 // Emergency protection (tetap dipakai)
