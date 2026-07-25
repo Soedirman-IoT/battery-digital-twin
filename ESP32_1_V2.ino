@@ -1,0 +1,1665 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <NimBLEDevice.h>
+#include "esp_eap_client.h"
+#include <time.h>
+#include <vector>
+
+// =====================================================
+// WIFI WPA2 ENTERPRISE + MQTT CONFIG
+// =====================================================
+const char* WIFI_SSID = "eduroam";
+
+#define EAP_IDENTITY "dimas.anhar@mhs.unsoed.ac.id"
+#define EAP_USERNAME "dimas.anhar@mhs.unsoed.ac.id"
+#define EAP_PASSWORD "Raihananhar##23076"
+
+const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883;
+
+const char* MQTT_CLIENT_ID = "esp32-bms-01";
+const char* MQTT_USERNAME = "hivemq.webclient.1780374811805";
+const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
+
+const char* MQTT_TOPIC_DATA   = "skripsi/bms01/data";
+const char* MQTT_TOPIC_STATUS = "skripsi/bms01/status";
+const char* MQTT_TOPIC_CONTROL = "skripsi/bms01/control";
+
+// Topic ini dipakai ESP1 untuk memberi izin/larangan kerja ke ESP2.
+// ESP2 cukup subscribe topic ini, lalu menjalankan DST-WLTC hanya saat motor_enable=true.
+const char* MQTT_TOPIC_MOTOR_CMD = "skripsi/motor01/cmd";
+
+const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
+unsigned long wifiDisconnectedSince = 0;
+const unsigned long WIFI_RESTART_TIMEOUT_MS = 120000; // 2 menit
+
+// ================= CONTROL MODE CONFIG =================
+// AUTO   : jam 01:00-23:00 sistem cycling boleh ON.
+//          di luar jam itu beban/motor OFF, tetapi charge tetap boleh ON jika baterai drop.
+// MANUAL : sistem mengikuti tombol ON/OFF dari MQTT.
+enum ControlMode {
+  CONTROL_AUTO,
+  CONTROL_MANUAL
+};
+
+ControlMode controlMode = CONTROL_AUTO;
+bool manualPower = false;
+bool scheduleActive = false;
+bool systemAllowed = false;
+
+// loadAllowed  : izin untuk menyalakan relay beban/motor.
+// chargeAllowed: izin untuk menyalakan relay charge.
+// Pada AUTO malam, loadAllowed=false tetapi chargeAllowed=true,
+// sehingga motor OFF tetapi baterai tetap bisa recovery charge jika drop.
+bool loadAllowed = false;
+bool chargeAllowed = false;
+bool nightChargeMode = false;
+
+const int SCHEDULE_START_HOUR = 1;
+const int SCHEDULE_STOP_HOUR  = 23;
+
+// ================= ROAD LOAD PROFILE CONFIG =================
+// 01:00 - 12:00 = tahap 1: motor DC tanpa beban resistor -> RELAY_LOAD ON, RELAY_RESISTOR OFF
+// 12:00 - 23:00 = tahap 2: motor DC dengan beban resistor -> RELAY_LOAD ON, RELAY_RESISTOR ON
+// 23:00 - 01:00 = istirahat/charge-only -> RELAY_LOAD OFF, RELAY_RESISTOR OFF
+//
+// Profil DST-WLTC untuk pengaturan speed BLDC dijalankan oleh ESP2.
+// ESP1 hanya mengirim izin motor_enable dan load_stage ke ESP2 melalui MQTT.
+const int FLAT_START_HOUR = 1;
+const int CLIMB_START_HOUR = 12;
+const int REST_START_HOUR = 23;
+
+enum RoadProfile {
+  ROAD_REST,
+  ROAD_FLAT,
+  ROAD_CLIMB
+};
+RoadProfile roadProfile = ROAD_REST;
+
+enum LoadStage {
+  LOAD_REST,
+  LOAD_FULL_SPEED,
+  LOAD_WLTC,
+  LOAD_WLTC_DUMMY
+};
+LoadStage loadStage = LOAD_REST;
+int currentHourWIB = -1;
+
+// ================= SOC LOAD STAGE =================
+const float FULL_TO_WLTC   = 80.0;
+const float WLTC_TO_FULL   = 82.0;
+const float WLTC_TO_DUMMY  = 40.0;
+const float DUMMY_TO_WLTC  = 42.0;
+
+const long GMT_OFFSET_SEC = 7 * 3600;
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+const char* controlModeToString() {
+  switch (controlMode) {
+    case CONTROL_AUTO: return "AUTO";
+    case CONTROL_MANUAL: return "MANUAL";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* roadProfileToString() {
+  switch (roadProfile) {
+    case ROAD_FLAT: return "FLAT";
+    case ROAD_CLIMB: return "CLIMB";
+    case ROAD_REST: return "REST";
+    default: return "UNKNOWN";
+  }
+}
+
+void updateRoadProfileFromCalendar() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 100)) {
+    currentHourWIB = -1;
+    roadProfile = ROAD_REST;
+    return;
+  }
+
+  currentHourWIB = timeinfo.tm_hour;
+
+  if (currentHourWIB >= FLAT_START_HOUR && currentHourWIB < CLIMB_START_HOUR) {
+    roadProfile = ROAD_FLAT;
+  } else if (currentHourWIB >= CLIMB_START_HOUR && currentHourWIB < REST_START_HOUR) {
+    roadProfile = ROAD_CLIMB;
+  } else {
+    roadProfile = ROAD_REST;
+  }
+}
+
+void updateScheduleState() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 100)) {
+    scheduleActive = false;
+    return;
+  }
+
+  int hour = timeinfo.tm_hour;
+  scheduleActive = (hour >= SCHEDULE_START_HOUR && hour < SCHEDULE_STOP_HOUR);
+}
+
+void updateSystemAllowed() {
+  updateScheduleState();
+  updateRoadProfileFromCalendar();
+
+  if (controlMode == CONTROL_AUTO) {
+    // Siang: beban/motor boleh jalan, charge juga boleh jalan jika baterai drop.
+    // Malam: beban/motor OFF, tetapi charge tetap boleh jalan jika baterai drop.
+    loadAllowed = scheduleActive;
+    chargeAllowed = true;
+    nightChargeMode = !scheduleActive;
+  } else {
+    // Manual OFF benar-benar mematikan sistem.
+    // Manual ON memberi izin beban dan charge, tetapi safety BMS tetap berlaku.
+    loadAllowed = manualPower;
+    chargeAllowed = manualPower;
+    nightChargeMode = false;
+  }
+  systemAllowed = loadAllowed || chargeAllowed;
+}
+
+
+WiFiClientSecure wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+unsigned long lastWifiReconnectAttempt = 0;
+unsigned long lastMqttReconnectAttempt = 0;
+unsigned long lastMqttPublish = 0;
+unsigned long lastMotorCommandPublish = 0;
+
+// ================= BMS BLE CONFIG =================
+const char* TARGET_ADDR = "20:25:03:32:08:0a";
+
+NimBLEClient* client = nullptr;
+NimBLERemoteCharacteristic* dataChar = nullptr;
+
+const int CELL_COUNT = 6;
+
+// ================= PIN RELAY =================
+const int RELAY_LOAD_PIN     = 26;
+const int RELAY_CHARGE_PIN   = 27;
+const int RELAY_RESISTOR_PIN = 25;
+
+const bool RELAY_ACTIVE_LOW = true;
+
+// ================= BATTERY DATA =================
+float packVoltage = 0.0;
+float cellVoltage[CELL_COUNT] = {0};
+float minCellVoltage = 0.0;
+float maxCellVoltage = 0.0;
+int minCellIndex = -1;
+int maxCellIndex = -1;
+
+float batteryCurrent = 0.0;
+float balanceCurrent = 0.0;
+
+float batteryT1 = 0.0;
+float batteryT2 = 0.0;
+float mosTemp = 0.0;
+
+// SoC valid untuk JK-BMS ini berasal dari full frame realtime 0x02 byte 173.
+float bmsSoc = 0.0;
+bool socValid = false;
+
+bool voltageValid = false;
+bool currentValid = false;
+bool balanceCurrentValid = false;
+bool tempValid = false;
+
+// ================= SAFETY TIMEOUT =================
+unsigned long lastBMSDataTime = 0;
+const unsigned long BMS_TIMEOUT_MS = 60000;
+
+// ================= RELAY STATE =================
+bool loadRelayOn = false;
+bool chargeRelayOn = false;
+bool resistorRelayOn = false;
+
+// ================= SYSTEM MODE =================
+enum SystemMode {
+  MODE_LOAD,
+  MODE_CHARGE,
+  MODE_TRANSITION_TO_LOAD,
+  MODE_TRANSITION_TO_CHARGE,
+  MODE_SAFE_OFF
+};
+
+SystemMode systemMode = MODE_SAFE_OFF;
+
+// ================= LIMIT SOC =================
+const float CHARGE_START_SOC = 20.0;   // mulai charge saat SoC <=20%
+const float CHARGE_STOP_SOC  = 95.0;   // berhenti charge saat SoC >=95%
+
+// Emergency protection (tetap dipakai)
+const float CHARGE_START_CELL_V = 3.0;
+const float CHARGE_STOP_CELL_V  = 4.2;
+
+const float PACK_CHARGE_START_V = 18.0;
+const float PACK_CHARGE_STOP_V  = 25.2;
+const float TEMP_OFF_C = 55.0;
+
+const unsigned long RELAY_SWITCH_DELAY_MS = 3000;
+
+// Minimum waktu charge.
+// Tujuannya agar setelah relay charge sempat ON, sistem tidak langsung pindah ke relay beban
+// hanya karena tegangan baterai naik sesaat / voltage rebound.
+const unsigned long MIN_CHARGE_TIME_MS = 5UL * 60UL * 1000UL;  // 5 menit
+
+// Konfirmasi tegangan.
+// Tujuannya agar relay tidak pindah mode hanya karena noise sesaat atau voltage rebound.
+// LOW dikonfirmasi lebih cepat agar baterai segera dilindungi.
+// FULL dikonfirmasi lebih lama agar charge tidak mati karena spike tegangan sesaat.
+const unsigned long LOW_VOLTAGE_CONFIRM_MS  = 3000;
+const unsigned long FULL_VOLTAGE_CONFIRM_MS = 10000;
+
+unsigned long transitionStart = 0;
+unsigned long chargeModeStart = 0;
+bool chargeMinTimerActive = false;
+
+// Latch/lock mode charge.
+// Jika baterai sudah dikonfirmasi LOW, beban dikunci OFF sampai baterai benar-benar FULL.
+// Ini inti perbaikan untuk mencegah relay beban ON-OFF karena voltage rebound.
+bool chargeLockActive = false;
+bool batteryLowRaw = false;
+bool batteryFullRaw = false;
+bool batteryLowConfirmed = false;
+bool batteryFullConfirmed = false;
+unsigned long batteryLowSince = 0;
+unsigned long batteryFullSince = 0;
+
+// ================= BMS REQUEST FRAME =================
+uint8_t requestSettings[] = {
+  0xAA, 0x55, 0x90, 0xEB, 0x96, 0x00, 0x79, 0x62, 0x96, 0xED,
+  0xE3, 0xD0, 0x82, 0xA1, 0x9B, 0x5B, 0x3C, 0x9C, 0x4B, 0x5D
+};
+
+uint8_t requestDeviceInfo[] = {
+  0xAA, 0x55, 0x90, 0xEB, 0x97, 0x00, 0xDF, 0x52, 0x88, 0x67,
+  0x9D, 0x0A, 0x09, 0x6B, 0x9A, 0xF6, 0x70, 0x9A, 0x17, 0xFD
+};
+
+// ================= JK-BMS FULL FRAME PROTOCOL =================
+// JK-BMS mengirim response BLE secara terpotong, biasanya 150 + 150 byte.
+// Karena SoC valid berada di byte 173, notification harus digabung dulu
+// menjadi full frame 300 byte sebelum diparse.
+std::vector<uint8_t> bmsFrameBuffer;
+
+const size_t JK_FRAME_SIZE = 300;
+const size_t JK_MAX_FRAME_SIZE = 384 + 16;
+const uint8_t JK_SOC_BYTE_INDEX = 173;
+const int JK_RUNTIME_OFFSET = 32;  // SoC byte 173 = byte 141 + 32, cocok untuk BMS ini.
+
+uint8_t calcJKCRC(const uint8_t* data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc += data[i];
+  }
+  return crc;
+}
+
+// ================= HELPER =================
+bool isOverTemp();
+void allRelayOff();
+void assembleBMSFrame(uint8_t* data, size_t len);
+
+uint16_t readUInt16LE(uint8_t* data, int index) {
+  return (uint16_t)data[index] | ((uint16_t)data[index + 1] << 8);
+}
+
+int16_t readInt16LE(uint8_t* data, int index) {
+  return (int16_t)((uint16_t)data[index] | ((uint16_t)data[index + 1] << 8));
+}
+
+uint32_t readUInt32LE(const uint8_t* data, int index) {
+  return (uint32_t)data[index] |
+         ((uint32_t)data[index + 1] << 8) |
+         ((uint32_t)data[index + 2] << 16) |
+         ((uint32_t)data[index + 3] << 24);
+}
+
+int32_t readInt32LE(const uint8_t* data, int index) {
+  return (int32_t)readUInt32LE(data, index);
+}
+
+bool isReasonableCellVoltage(float v) {
+  return v >= 2.0 && v <= 4.5;
+}
+
+bool isReasonablePackVoltage(float v) {
+  return v >= 10.0 && v <= 30.0;
+}
+
+bool isReasonableCurrent(float a) {
+  return a >= -100.0 && a <= 100.0;
+}
+
+bool isReasonableTemp(float t) {
+  return t >= -20.0 && t <= 100.0;
+}
+
+bool isBMSTimeout() {
+  if (lastBMSDataTime == 0) return true;
+  return millis() - lastBMSDataTime > BMS_TIMEOUT_MS;
+}
+
+const char* systemModeToString() {
+  switch (systemMode) {
+    case MODE_LOAD: return "LOAD";
+    case MODE_CHARGE: return "CHARGE";
+    case MODE_TRANSITION_TO_LOAD: return "TRANSITION_TO_LOAD";
+    case MODE_TRANSITION_TO_CHARGE: return "TRANSITION_TO_CHARGE";
+    case MODE_SAFE_OFF: return "SAFE_OFF";
+    default: return "UNKNOWN";
+  }
+}
+
+bool isBatteryDataSafeForMotor() {
+  if (!voltageValid || isBMSTimeout()) return false;
+  if (isOverTemp()) return false;
+  if (chargeLockActive || batteryLowConfirmed) return false;
+  return true;
+}
+
+bool isMotorEnableForESP2() {
+  return
+    systemMode == MODE_LOAD &&
+    loadRelayOn &&
+    !chargeRelayOn &&
+    loadAllowed &&
+    isBatteryDataSafeForMotor();
+}
+
+void updateLoadStage(){
+  if (!socValid)
+  {
+    loadStage = LOAD_REST;
+    return;
+  }
+
+  switch(loadStage)
+  {
+    case LOAD_REST:
+
+      if(bmsSoc > FULL_TO_WLTC)
+      {
+        loadStage = LOAD_FULL_SPEED;
+      }
+      else if(bmsSoc > WLTC_TO_DUMMY)
+      {
+        loadStage = LOAD_WLTC;
+      }
+      else
+      {
+        loadStage = LOAD_WLTC_DUMMY;
+      }
+
+      break;
+
+
+    case LOAD_FULL_SPEED:
+
+      if(bmsSoc <= FULL_TO_WLTC)
+      {
+        loadStage = LOAD_WLTC;
+      }
+
+      break;
+
+
+    case LOAD_WLTC:
+
+      if(bmsSoc >= WLTC_TO_FULL)
+      {
+        loadStage = LOAD_FULL_SPEED;
+      }
+      else if(bmsSoc <= WLTC_TO_DUMMY)
+      {
+        loadStage = LOAD_WLTC_DUMMY;
+      }
+
+      break;
+
+
+    case LOAD_WLTC_DUMMY:
+
+      if(bmsSoc >= DUMMY_TO_WLTC)
+      {
+        loadStage = LOAD_WLTC;
+      }
+
+      break;
+  }
+}
+
+const char* getESP2LoadStage(){
+    if (!isMotorEnableForESP2())
+        return "REST";
+
+    switch(loadStage)
+    {
+        case LOAD_FULL_SPEED:
+            return "FULL_SPEED";
+
+        case LOAD_WLTC:
+            return "WLTC";
+
+        case LOAD_WLTC_DUMMY:
+            return "WLTC_DUMMY";
+
+        default:
+            return "REST";
+    }
+}
+
+bool isMinimumChargeTimeDone() {
+  if (!chargeMinTimerActive) return true;
+  return millis() - chargeModeStart >= MIN_CHARGE_TIME_MS;
+}
+
+unsigned long getRemainingMinChargeSeconds() {
+  if (!chargeMinTimerActive) return 0;
+
+  unsigned long elapsed = millis() - chargeModeStart;
+  if (elapsed >= MIN_CHARGE_TIME_MS) return 0;
+
+  return (MIN_CHARGE_TIME_MS - elapsed) / 1000UL;
+}
+
+void updateBatteryThresholdState() {
+  unsigned long now = millis();
+
+  // ======================
+  // PRIORITAS : SoC
+  // ======================
+  if (socValid) {
+
+    batteryLowRaw  = (bmsSoc <= CHARGE_START_SOC);
+
+    batteryFullRaw = (bmsSoc >= CHARGE_STOP_SOC);
+
+  }
+  // ======================
+  // FALLBACK : Tegangan
+  // ======================
+  else {
+
+    batteryLowRaw =
+        minCellVoltage <= CHARGE_START_CELL_V ||
+        packVoltage <= PACK_CHARGE_START_V;
+
+    batteryFullRaw =
+        maxCellVoltage >= CHARGE_STOP_CELL_V ||
+        packVoltage >= PACK_CHARGE_STOP_V;
+  }
+
+  if (batteryLowRaw) {
+    if (batteryLowSince == 0) batteryLowSince = now;
+  } else {
+    batteryLowSince = 0;
+  }
+
+  if (batteryFullRaw) {
+    if (batteryFullSince == 0) batteryFullSince = now;
+  } else {
+    batteryFullSince = 0;
+  }
+
+  batteryLowConfirmed =
+    batteryLowRaw &&
+    batteryLowSince != 0 &&
+    now - batteryLowSince >= LOW_VOLTAGE_CONFIRM_MS;
+
+  batteryFullConfirmed =
+    batteryFullRaw &&
+    batteryFullSince != 0 &&
+    now - batteryFullSince >= FULL_VOLTAGE_CONFIRM_MS;
+
+  // Begitu LOW valid, kunci sistem ke charge.
+  // Jangan buka lock hanya karena tegangan naik sesaat setelah beban OFF.
+  if (batteryLowConfirmed) {
+    chargeLockActive = true;
+  }
+
+  // Lock baru dilepas kalau FULL sudah stabil.
+  if (batteryFullConfirmed) {
+    chargeLockActive = false;
+    chargeMinTimerActive = false;
+  }
+}
+
+// ================= WIFI + MQTT FUNCTION =================
+void setupWiFi() {
+  Serial.println();
+  Serial.println("Connecting to WPA2-Enterprise WiFi...");
+
+  WiFi.disconnect(true);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  esp_eap_client_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+  esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+  esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+
+  esp_wifi_sta_enterprise_enable();
+
+  WiFi.begin(WIFI_SSID);
+
+  Serial.print("Connecting WiFi");
+  unsigned long startAttempt = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi not connected. System still runs, MQTT offline.");
+  }
+}
+
+void maintainWiFi() {
+
+  // Jika WiFi sudah tersambung
+  if (WiFi.status() == WL_CONNECTED) {
+
+    wifiDisconnectedSince = 0;
+    return;
+  }
+
+  // Catat kapan mulai disconnect
+  if (wifiDisconnectedSince == 0) {
+    wifiDisconnectedSince = millis();
+    Serial.println("WiFi disconnected!");
+  }
+
+  unsigned long now = millis();
+
+  // Coba reconnect setiap 5 detik
+  if (now - lastWifiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
+
+    lastWifiReconnectAttempt = now;
+
+    Serial.println("Reconnecting WiFi...");
+
+    WiFi.disconnect(true);
+    delay(500);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+
+    // Konfigurasi ulang WPA2 Enterprise
+    esp_eap_client_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+    esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+    esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+    esp_wifi_sta_enterprise_enable();
+
+    WiFi.begin(WIFI_SSID);
+  }
+
+  // Sudah gagal reconnect lebih dari 2 menit?
+  if (now - wifiDisconnectedSince >= WIFI_RESTART_TIMEOUT_MS) {
+
+    Serial.println("==================================");
+    Serial.println("WiFi reconnect timeout!");
+    Serial.println("Restarting ESP32...");
+    Serial.println("==================================");
+
+    delay(1000);
+
+    ESP.restart();
+  }
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  if (String(topic) != MQTT_TOPIC_CONTROL) return;
+
+  ControlMode previousControlMode = controlMode;
+  bool previousManualPower = manualPower;
+
+  char msg[160];
+  unsigned int copyLen = length;
+
+  if (copyLen >= sizeof(msg)) {
+    copyLen = sizeof(msg) - 1;
+  }
+
+  memcpy(msg, payload, copyLen);
+  msg[copyLen] = '\0';
+
+  String command = String(msg);
+  command.toLowerCase();
+
+  // Format utama:
+  // {"mode":"auto"}
+  // {"mode":"manual","power":true}
+  // {"mode":"manual","power":false}
+  //
+  // Format tambahan yang tetap diterima:
+  // {"mode":"toggle"}
+  // on
+  // off
+
+  if (command.indexOf("auto") >= 0) {
+    controlMode = CONTROL_AUTO;
+  } else if (command.indexOf("manual") >= 0) {
+    controlMode = CONTROL_MANUAL;
+
+    if (command.indexOf("true") >= 0 || command.indexOf("on") >= 0) {
+      manualPower = true;
+    } else if (command.indexOf("false") >= 0 || command.indexOf("off") >= 0) {
+      manualPower = false;
+    }
+  } else if (command.indexOf("toggle") >= 0) {
+    controlMode = CONTROL_MANUAL;
+    manualPower = !manualPower;
+  } else if (command.indexOf("on") >= 0) {
+    controlMode = CONTROL_MANUAL;
+    manualPower = true;
+  } else if (command.indexOf("off") >= 0) {
+    controlMode = CONTROL_MANUAL;
+    manualPower = false;
+  }
+
+  updateSystemAllowed();
+
+  // Saat pindah mode, matikan relay dulu dan paksa state machine evaluasi ulang dari kondisi aman.
+  // Ini mencegah relay beban mempertahankan state lama ketika pindah MANUAL -> AUTO.
+  if (previousControlMode != controlMode || previousManualPower != manualPower) {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+    transitionStart = millis();
+  }
+
+  if (!systemAllowed) {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+  }
+
+  Serial.print("Control Mode: ");
+  Serial.print(controlModeToString());
+  Serial.print(" | Manual Power: ");
+  Serial.println(manualPower ? "ON" : "OFF");
+
+  mqttClient.publish(MQTT_TOPIC_STATUS, controlModeToString(), true);
+}
+
+
+void setupMQTT() {
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setBufferSize(2048);
+  mqttClient.setCallback(onMqttMessage);
+}
+
+void maintainMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastMqttReconnectAttempt < MQTT_RECONNECT_INTERVAL_MS) return;
+  lastMqttReconnectAttempt = now;
+
+  Serial.print("Connecting MQTT... ");
+
+  bool connected = mqttClient.connect(
+    MQTT_CLIENT_ID,
+    MQTT_USERNAME,
+    MQTT_PASSWORD,
+    MQTT_TOPIC_STATUS,
+    1,
+    true,
+    "offline"
+  );
+
+  if (connected) {
+    Serial.println("connected.");
+    mqttClient.publish(MQTT_TOPIC_STATUS, "online", true);
+    mqttClient.subscribe(MQTT_TOPIC_CONTROL);
+  } else {
+    Serial.print("failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+void publishMQTTData() {
+  if (!mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttPublish < MQTT_PUBLISH_INTERVAL_MS) return;
+  lastMqttPublish = now;
+
+  char payload[1400];
+
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{"
+      "\"timestamp_ms\":%lu,"
+      "\"bms_timeout\":%s,"
+      "\"voltage_valid\":%s,"
+      "\"current_valid\":%s,"
+      "\"temp_valid\":%s,"
+      "\"soc_valid\":%s,"
+      "\"bms_soc\":%.1f,"
+      "\"pack_voltage\":%.3f,"
+      "\"cell_1\":%.3f,"
+      "\"cell_2\":%.3f,"
+      "\"cell_3\":%.3f,"
+      "\"cell_4\":%.3f,"
+      "\"cell_5\":%.3f,"
+      "\"cell_6\":%.3f,"
+      "\"min_cell_voltage\":%.3f,"
+      "\"max_cell_voltage\":%.3f,"
+      "\"delta_cell_voltage\":%.3f,"
+      "\"min_cell_index\":%d,"
+      "\"max_cell_index\":%d,"
+      "\"battery_current\":%.3f,"
+      "\"balance_current\":%.3f,"
+      "\"battery_t1\":%.1f,"
+      "\"battery_t2\":%.1f,"
+      "\"mos_temp\":%.1f,"
+      "\"system_mode\":\"%s\","
+      "\"relay_load\":%s,"
+      "\"relay_charge\":%s,"
+      "\"relay_resistor\":%s,"
+      "\"motor_enable\":%s,"
+      "\"esp2_load_stage\":\"%s\","
+      "\"road_profile\":\"%s\","
+      "\"current_hour_wib\":%d,"
+      "\"control_mode\":\"%s\","
+      "\"manual_power\":%s,"
+      "\"schedule_active\":%s,"
+      "\"system_allowed\":%s,"
+      "\"load_allowed\":%s,"
+      "\"charge_allowed\":%s,"
+      "\"night_charge_mode\":%s,"
+      "\"battery_low_raw\":%s,"
+      "\"battery_low_confirmed\":%s,"
+      "\"battery_full_raw\":%s,"
+      "\"battery_full_confirmed\":%s,"
+      "\"charge_lock_active\":%s,"
+      "\"charge_min_timer_active\":%s,"
+      "\"charge_min_remaining_sec\":%lu"
+    "}",
+    now,
+    isBMSTimeout() ? "true" : "false",
+    voltageValid ? "true" : "false",
+    currentValid ? "true" : "false",
+    tempValid ? "true" : "false",
+    socValid ? "true" : "false",
+    bmsSoc,
+    packVoltage,
+    cellVoltage[0],
+    cellVoltage[1],
+    cellVoltage[2],
+    cellVoltage[3],
+    cellVoltage[4],
+    cellVoltage[5],
+    minCellVoltage,
+    maxCellVoltage,
+    maxCellVoltage - minCellVoltage,
+    minCellIndex + 1,
+    maxCellIndex + 1,
+    batteryCurrent,
+    balanceCurrent,
+    batteryT1,
+    batteryT2,
+    mosTemp,
+    systemModeToString(),
+    loadRelayOn ? "true" : "false",
+    chargeRelayOn ? "true" : "false",
+    resistorRelayOn ? "true" : "false",
+    isMotorEnableForESP2() ? "true" : "false",
+    getESP2LoadStage(),
+    roadProfileToString(),
+    currentHourWIB,
+    controlModeToString(),
+    manualPower ? "true" : "false",
+    scheduleActive ? "true" : "false",
+    systemAllowed ? "true" : "false",
+    loadAllowed ? "true" : "false",
+    chargeAllowed ? "true" : "false",
+    nightChargeMode ? "true" : "false",
+    batteryLowRaw ? "true" : "false",
+    batteryLowConfirmed ? "true" : "false",
+    batteryFullRaw ? "true" : "false",
+    batteryFullConfirmed ? "true" : "false",
+    chargeLockActive ? "true" : "false",
+    chargeMinTimerActive ? "true" : "false",
+    getRemainingMinChargeSeconds()
+  );
+
+  bool ok = mqttClient.publish(MQTT_TOPIC_DATA, payload, false);
+
+  Serial.print("MQTT publish: ");
+  Serial.println(ok ? "OK" : "FAILED");
+}
+
+void publishESP2Command() {
+  if (!mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMotorCommandPublish < MQTT_PUBLISH_INTERVAL_MS) return;
+  lastMotorCommandPublish = now;
+
+  char payload[700];
+
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{"
+      "\"timestamp_ms\":%lu,"
+      "\"motor_enable\":%s,"
+      "\"load_stage\":\"%s\","
+      "\"road_profile\":\"%s\","
+      "\"system_mode\":\"%s\","
+      "\"battery_safe\":%s,"
+      "\"bms_timeout\":%s,"
+      "\"load_allowed\":%s,"
+      "\"charge_allowed\":%s,"
+      "\"relay_load\":%s,"
+      "\"relay_charge\":%s,"
+      "\"relay_resistor\":%s,"
+      "\"charge_lock_active\":%s,"
+      "\"battery_low_confirmed\":%s,"
+      "\"battery_full_confirmed\":%s"
+    "}",
+    now,
+    isMotorEnableForESP2() ? "true" : "false",
+    getESP2LoadStage(),
+    roadProfileToString(),
+    systemModeToString(),
+    isBatteryDataSafeForMotor() ? "true" : "false",
+    isBMSTimeout() ? "true" : "false",
+    loadAllowed ? "true" : "false",
+    chargeAllowed ? "true" : "false",
+    loadRelayOn ? "true" : "false",
+    chargeRelayOn ? "true" : "false",
+    resistorRelayOn ? "true" : "false",
+    chargeLockActive ? "true" : "false",
+    batteryLowConfirmed ? "true" : "false",
+    batteryFullConfirmed ? "true" : "false"
+  );
+
+  mqttClient.publish(MQTT_TOPIC_MOTOR_CMD, payload, true);
+}
+
+// ================= FAIL SAFE =================
+void setRelay(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+void updateRelayOutput() {
+  // ESP1 memegang kendali penuh semua relay.
+  // Relay resistor hanya boleh ON pada tahap 2 / CLIMB ketika sistem benar-benar sedang LOAD.
+  // Pada CHARGE, SAFE_OFF, TRANSITION, malam/istirahat, atau data waktu invalid, resistor dipaksa OFF.
+  updateRoadProfileFromCalendar();
+
+  resistorRelayOn =
+    loadRelayOn &&
+    !chargeRelayOn &&
+    loadAllowed &&
+    systemMode == MODE_LOAD &&
+    loadStage == LOAD_WLTC_DUMMY;
+
+  setRelay(RELAY_LOAD_PIN, loadRelayOn);
+  setRelay(RELAY_CHARGE_PIN, chargeRelayOn);
+  setRelay(RELAY_RESISTOR_PIN, resistorRelayOn);
+}
+
+void allRelayOff() {
+  loadRelayOn = false;
+  chargeRelayOn = false;
+  resistorRelayOn = false;
+  updateRelayOutput();
+}
+
+// ================= BMS PARSING =================
+void updateFromFullJKFrame(const uint8_t* data, size_t len) {
+  if (len < JK_FRAME_SIZE) return;
+
+  bool validHeader =
+    data[0] == 0x55 &&
+    data[1] == 0xAA &&
+    data[2] == 0xEB &&
+    data[3] == 0x90;
+
+  if (!validHeader) {
+    Serial.println("Frame BMS ditolak: header bukan 55 AA EB 90");
+    return;
+  }
+
+  if (data[4] != 0x02) {
+    Serial.print("Bukan frame realtime/cell info. Type: 0x");
+    Serial.println(data[4], HEX);
+    return;
+  }
+
+  uint8_t computedCRC = calcJKCRC(data, JK_FRAME_SIZE - 1);
+  uint8_t remoteCRC = data[JK_FRAME_SIZE - 1];
+  if (computedCRC != remoteCRC) {
+    Serial.print("CRC frame BMS gagal: computed=0x");
+    Serial.print(computedCRC, HEX);
+    Serial.print(" remote=0x");
+    Serial.println(remoteCRC, HEX);
+    return;
+  }
+
+  // Cell voltage tetap berada mulai byte 6, little-endian, satuan mV.
+  float totalCell = 0.0;
+  bool cellOk = true;
+
+  for (int i = 0; i < CELL_COUNT; i++) {
+    uint16_t mv = (uint16_t)data[6 + i * 2] | ((uint16_t)data[7 + i * 2] << 8);
+    float v = mv * 0.001f;
+
+    cellVoltage[i] = v;
+    totalCell += v;
+
+    if (!isReasonableCellVoltage(v)) {
+      cellOk = false;
+    }
+  }
+
+  // SoC yang sudah lu kalibrasi dengan aplikasi JK-BMS.
+  uint8_t socRaw = data[JK_SOC_BYTE_INDEX];
+  if (socRaw <= 100) {
+    bmsSoc = (float)socRaw;
+    socValid = true;
+  } else {
+    socValid = false;
+  }
+
+  // Layout runtime ikut offset +32, karena BMS lu cocok di mode JK02_32S.
+  float totalFromFrame = readUInt32LE(data, 118 + JK_RUNTIME_OFFSET) * 0.001f;
+  if (isReasonablePackVoltage(totalFromFrame)) {
+    packVoltage = totalFromFrame;
+    voltageValid = true;
+  } else if (cellOk && isReasonablePackVoltage(totalCell)) {
+    packVoltage = totalCell;
+    voltageValid = true;
+  } else {
+    voltageValid = false;
+  }
+
+  if (cellOk) {
+    minCellVoltage = cellVoltage[0];
+    maxCellVoltage = cellVoltage[0];
+    minCellIndex = 0;
+    maxCellIndex = 0;
+
+    for (int i = 1; i < CELL_COUNT; i++) {
+      if (cellVoltage[i] < minCellVoltage) {
+        minCellVoltage = cellVoltage[i];
+        minCellIndex = i;
+      }
+
+      if (cellVoltage[i] > maxCellVoltage) {
+        maxCellVoltage = cellVoltage[i];
+        maxCellIndex = i;
+      }
+    }
+  }
+
+  float current = readInt32LE(data, 126 + JK_RUNTIME_OFFSET) * 0.001f;
+  currentValid = isReasonableCurrent(current);
+  if (currentValid) {
+    batteryCurrent = current;
+  }
+
+  float balCurrent = ((int16_t)((uint16_t)data[138 + JK_RUNTIME_OFFSET] | ((uint16_t)data[139 + JK_RUNTIME_OFFSET] << 8))) * 0.001f;
+  balanceCurrentValid = isReasonableCurrent(balCurrent);
+  if (balanceCurrentValid) {
+    balanceCurrent = balCurrent;
+  }
+
+  float t1 = ((int16_t)((uint16_t)data[130 + JK_RUNTIME_OFFSET] | ((uint16_t)data[131 + JK_RUNTIME_OFFSET] << 8))) * 0.1f;
+  float t2 = ((int16_t)((uint16_t)data[132 + JK_RUNTIME_OFFSET] | ((uint16_t)data[133 + JK_RUNTIME_OFFSET] << 8))) * 0.1f;
+  float mos = ((int16_t)((uint16_t)data[112 + JK_RUNTIME_OFFSET] | ((uint16_t)data[113 + JK_RUNTIME_OFFSET] << 8))) * 0.1f;
+
+  tempValid = isReasonableTemp(t1) && isReasonableTemp(t2);
+  if (tempValid) {
+    batteryT1 = t1;
+    batteryT2 = t2;
+    if (isReasonableTemp(mos)) {
+      mosTemp = mos;
+    }
+  }
+
+  lastBMSDataTime = millis();
+}
+
+void assembleBMSFrame(uint8_t* data, size_t len) {
+  if (len == 0) return;
+
+  bool hasHeader =
+    len >= 4 &&
+    data[0] == 0x55 &&
+    data[1] == 0xAA &&
+    data[2] == 0xEB &&
+    data[3] == 0x90;
+
+  bool isEchoOrAck =
+    len >= 4 &&
+    data[0] == 0xAA &&
+    data[1] == 0x55 &&
+    data[2] == 0x90 &&
+    data[3] == 0xEB;
+
+  if (isEchoOrAck) {
+    return;
+  }
+
+  if (hasHeader) {
+    bmsFrameBuffer.clear();
+  }
+
+  if (bmsFrameBuffer.size() + len > JK_MAX_FRAME_SIZE) {
+    Serial.println("Frame buffer BMS terlalu panjang, reset buffer.");
+    bmsFrameBuffer.clear();
+  }
+
+  bmsFrameBuffer.insert(bmsFrameBuffer.end(), data, data + len);
+
+  if (bmsFrameBuffer.size() >= JK_FRAME_SIZE) {
+    updateFromFullJKFrame(bmsFrameBuffer.data(), bmsFrameBuffer.size());
+    bmsFrameBuffer.clear();
+  }
+}
+
+void updateVoltageData(uint8_t* data, size_t len) {
+  if (len < 6 + CELL_COUNT * 2) return;
+
+  float total = 0.0;
+  bool valid = true;
+
+  for (int i = 0; i < CELL_COUNT; i++) {
+    uint16_t mv = readUInt16LE(data, 6 + i * 2);
+    float v = mv / 1000.0;
+
+    if (!isReasonableCellVoltage(v)) valid = false;
+
+    cellVoltage[i] = v;
+    total += v;
+  }
+
+  if (!valid || !isReasonablePackVoltage(total)) return;
+
+  packVoltage = total;
+
+  minCellVoltage = cellVoltage[0];
+  maxCellVoltage = cellVoltage[0];
+  minCellIndex = 0;
+  maxCellIndex = 0;
+
+  for (int i = 1; i < CELL_COUNT; i++) {
+    if (cellVoltage[i] < minCellVoltage) {
+      minCellVoltage = cellVoltage[i];
+      minCellIndex = i;
+    }
+
+    if (cellVoltage[i] > maxCellVoltage) {
+      maxCellVoltage = cellVoltage[i];
+      maxCellIndex = i;
+    }
+  }
+
+  voltageValid = true;
+  lastBMSDataTime = millis();
+}
+
+void updateExtraData(uint8_t* data, size_t len) {
+  if (len <= 120) return;
+
+  float current = readInt16LE(data, 8) / 1000.0;
+  float balCurrent = readInt16LE(data, 20) / 1000.0;
+
+  float t1 = readInt16LE(data, 12) / 10.0;
+  float t2 = readInt16LE(data, 14) / 10.0;
+  float mos = readInt16LE(data, 104) / 10.0;
+
+  currentValid = isReasonableCurrent(current);
+  balanceCurrentValid = isReasonableCurrent(balCurrent);
+  tempValid = isReasonableTemp(t1) && isReasonableTemp(t2) && isReasonableTemp(mos);
+
+  if (currentValid) batteryCurrent = current;
+  if (balanceCurrentValid) balanceCurrent = balCurrent;
+
+  if (tempValid) {
+    batteryT1 = t1;
+    batteryT2 = t2;
+    mosTemp = mos;
+  }
+
+  lastBMSDataTime = millis();
+}
+
+bool isOverTemp() {
+  if (!tempValid) return false;
+
+  return batteryT1 >= TEMP_OFF_C ||
+         batteryT2 >= TEMP_OFF_C ||
+         mosTemp >= TEMP_OFF_C;
+}
+
+// ================= RELAY CONTROL =================
+void controlRelays() {
+  updateSystemAllowed();
+
+  if (!voltageValid || isBMSTimeout()) {
+    systemMode = MODE_SAFE_OFF;
+    chargeLockActive = false;
+    chargeMinTimerActive = false;
+    allRelayOff();
+    return;
+  }
+
+  if (isOverTemp()) {
+    systemMode = MODE_SAFE_OFF;
+    chargeLockActive = false;
+    chargeMinTimerActive = false;
+    allRelayOff();
+    return;
+  }
+
+  // Kalau manual OFF, atau semua izin mati, sistem benar-benar OFF.
+  if (!systemAllowed) {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+    return;
+  }
+
+  updateBatteryThresholdState();
+
+  unsigned long now = millis();
+
+  bool chargeMinimumNotDone =
+    chargeMinTimerActive &&
+    (now - chargeModeStart < MIN_CHARGE_TIME_MS);
+
+  // Inti perbaikan:
+  // shouldCharge memakai chargeLockActive, bukan tegangan sesaat.
+  // Jadi setelah baterai LOW, sistem tetap CHARGE sampai FULL stabil.
+  bool shouldCharge =
+    chargeAllowed &&
+    !batteryFullConfirmed &&
+    (chargeLockActive || chargeMinimumNotDone);
+
+  // Beban hanya boleh ON kalau tidak ada charge lock dan tidak dalam timer minimum charge.
+  // Ini mencegah beban hidup lagi akibat voltage rebound.
+  bool shouldLoad =
+    loadAllowed &&
+    !chargeLockActive &&
+    !chargeMinimumNotDone &&
+    !batteryLowConfirmed;
+
+  switch (systemMode) {
+    case MODE_SAFE_OFF:
+      allRelayOff();
+
+      if (shouldCharge) {
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_CHARGE;
+      } else if (shouldLoad) {
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_LOAD;
+      } else {
+        // AUTO malam dan baterai belum low:
+        // relay beban OFF, relay charge OFF, ESP32 tetap monitoring + publish data.
+        systemMode = MODE_SAFE_OFF;
+      }
+      break;
+
+    case MODE_LOAD:
+      loadRelayOn = true;
+      chargeRelayOn = false;
+
+      // Jika jadwal AUTO sudah lewat jam 19:00, atau manual dimatikan,
+      // beban/motor wajib OFF.
+      if (!loadAllowed) {
+        allRelayOff();
+
+        if (shouldCharge) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_CHARGE;
+        } else {
+          systemMode = MODE_SAFE_OFF;
+        }
+        break;
+      }
+
+      // Saat LOW sudah confirmed, langsung matikan beban dan masuk transisi charge.
+      // Karena chargeLockActive sudah ON, beban tidak akan nyala lagi walaupun tegangan rebound.
+      if (shouldCharge) {
+        allRelayOff();
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_CHARGE;
+      }
+      break;
+
+    case MODE_TRANSITION_TO_CHARGE:
+      allRelayOff();
+
+      // Jangan batalkan transisi hanya karena batteryLowRaw hilang akibat rebound.
+      // Batalkan hanya kalau charge memang tidak diizinkan lagi atau baterai sudah full confirmed.
+      if (!shouldCharge) {
+        if (shouldLoad) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_LOAD;
+        } else {
+          systemMode = MODE_SAFE_OFF;
+        }
+        break;
+      }
+
+      if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
+        chargeRelayOn = true;
+        loadRelayOn = false;
+
+        // Timer dimulai saat benar-benar masuk mode charge.
+        // Kalau timer sebelumnya masih aktif, jangan reset.
+        if (!chargeMinTimerActive || now - chargeModeStart >= MIN_CHARGE_TIME_MS) {
+          chargeModeStart = now;
+          chargeMinTimerActive = true;
+        }
+
+        systemMode = MODE_CHARGE;
+        updateRelayOutput();
+      }
+      break;
+
+    case MODE_CHARGE:
+      chargeRelayOn = true;
+      loadRelayOn = false;
+
+      // Kalau izin charge hilang, misalnya manual OFF, charge wajib mati.
+      if (!chargeAllowed) {
+        allRelayOff();
+        systemMode = MODE_SAFE_OFF;
+        break;
+      }
+
+      // Safety tetap prioritas: charge baru berhenti kalau FULL sudah stabil.
+      if (batteryFullConfirmed) {
+        chargeLockActive = false;
+        chargeMinTimerActive = false;
+        allRelayOff();
+
+        if (loadAllowed) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_LOAD;
+        } else {
+          // AUTO malam: setelah penuh, jangan pindah ke beban.
+          systemMode = MODE_SAFE_OFF;
+        }
+      }
+
+      // Kalau belum full confirmed, sistem tetap CHARGE.
+      // Ini sengaja supaya tidak pindah ke LOAD hanya karena voltage rebound.
+      break;
+
+    case MODE_TRANSITION_TO_LOAD:
+      allRelayOff();
+
+      // Kalau jadwal sudah lewat atau manual OFF, jangan lanjut ke beban.
+      if (!loadAllowed) {
+        if (shouldCharge) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_CHARGE;
+        } else {
+          systemMode = MODE_SAFE_OFF;
+        }
+        break;
+      }
+
+      // Kalau charge lock aktif lagi, batalkan transisi ke LOAD.
+      if (shouldCharge) {
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_CHARGE;
+        break;
+      }
+
+      if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
+        loadRelayOn = true;
+        chargeRelayOn = false;
+        systemMode = MODE_LOAD;
+        updateRelayOutput();
+      }
+      break;
+  }
+
+  updateRelayOutput();
+}
+
+// ================= PRINT =================
+void printDataForControl() {
+  Serial.println();
+  Serial.println("===== DATA BMS + RELAY + MQTT =====");
+
+  Serial.print("WiFi                   : ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+
+  Serial.print("MQTT                   : ");
+  Serial.println(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED");
+
+  Serial.print("BMS Timeout            : ");
+  Serial.println(isBMSTimeout() ? "YES" : "NO");
+
+  if (socValid) {
+    Serial.print("SoC BMS                : ");
+    Serial.print(bmsSoc, 1);
+    Serial.println(" %");
+  } else {
+    Serial.println("SoC BMS                : belum valid");
+  }
+
+  if (voltageValid) {
+    Serial.print("Tegangan Total Baterai : ");
+    Serial.print(packVoltage, 3);
+    Serial.println(" V");
+
+    for (int i = 0; i < CELL_COUNT; i++) {
+      Serial.print("Tegangan Cell ");
+      Serial.print(i + 1);
+      Serial.print("        : ");
+      Serial.print(cellVoltage[i], 3);
+      Serial.println(" V");
+    }
+
+    Serial.print("Tegangan Minimum       : Cell ");
+    Serial.print(minCellIndex + 1);
+    Serial.print(" = ");
+    Serial.print(minCellVoltage, 3);
+    Serial.println(" V");
+
+    Serial.print("Tegangan Maksimum      : Cell ");
+    Serial.print(maxCellIndex + 1);
+    Serial.print(" = ");
+    Serial.print(maxCellVoltage, 3);
+    Serial.println(" V");
+  } else {
+    Serial.println("Data tegangan          : belum valid");
+  }
+
+  if (currentValid) {
+    Serial.print("Arus Baterai           : ");
+    Serial.print(batteryCurrent, 3);
+    Serial.println(" A");
+  } else {
+    Serial.println("Arus Baterai           : belum valid");
+  }
+
+  if (tempValid) {
+    Serial.print("Battery T1             : ");
+    Serial.print(batteryT1, 1);
+    Serial.println(" C");
+
+    Serial.print("Battery T2             : ");
+    Serial.print(batteryT2, 1);
+    Serial.println(" C");
+
+    Serial.print("MOS Temp               : ");
+    Serial.print(mosTemp, 1);
+    Serial.println(" C");
+  } else {
+    Serial.println("Temperatur             : belum valid");
+  }
+
+  Serial.print("Mode Kontrol           : ");
+  Serial.println(controlModeToString());
+
+  Serial.print("Manual Power           : ");
+  Serial.println(manualPower ? "ON" : "OFF");
+
+  Serial.print("Jadwal Aktif           : ");
+  Serial.println(scheduleActive ? "YES" : "NO");
+
+  Serial.print("System Allowed         : ");
+  Serial.println(systemAllowed ? "YES" : "NO");
+
+  Serial.print("Load Allowed           : ");
+  Serial.println(loadAllowed ? "YES" : "NO");
+
+  Serial.print("Charge Allowed         : ");
+  Serial.println(chargeAllowed ? "YES" : "NO");
+
+  Serial.print("Night Charge Mode      : ");
+  Serial.println(nightChargeMode ? "YES" : "NO");
+
+  Serial.print("Battery Low Raw        : ");
+  Serial.println(batteryLowRaw ? "YES" : "NO");
+
+  Serial.print("Battery Low Confirmed  : ");
+  Serial.println(batteryLowConfirmed ? "YES" : "NO");
+
+  Serial.print("Battery Full Raw       : ");
+  Serial.println(batteryFullRaw ? "YES" : "NO");
+
+  Serial.print("Battery Full Confirmed : ");
+  Serial.println(batteryFullConfirmed ? "YES" : "NO");
+
+  Serial.print("Charge Lock Active     : ");
+  Serial.println(chargeLockActive ? "YES" : "NO");
+
+  Serial.print("Mode Sistem            : ");
+  Serial.println(systemModeToString());
+
+  Serial.print("Relay Beban            : ");
+  Serial.println(loadRelayOn ? "ON" : "OFF");
+
+  Serial.print("Relay Charge           : ");
+  Serial.println(chargeRelayOn ? "ON" : "OFF");
+
+  Serial.print("Relay Resistor         : ");
+  Serial.println(resistorRelayOn ? "ON" : "OFF");
+
+  Serial.print("Motor Enable ke ESP2   : ");
+  Serial.println(isMotorEnableForESP2() ? "YES" : "NO");
+
+  Serial.print("Stage untuk ESP2       : ");
+  Serial.println(getESP2LoadStage());
+
+  Serial.print("Profil Jalan           : ");
+  Serial.println(roadProfileToString());
+
+  Serial.print("Jam WIB                : ");
+  if (currentHourWIB >= 0) Serial.println(currentHourWIB);
+  else Serial.println("TIME INVALID");
+
+  Serial.print("Timer Minimum Charge   : ");
+  Serial.print(chargeMinTimerActive ? "ACTIVE" : "INACTIVE");
+  Serial.print(" | Sisa ");
+  Serial.print(getRemainingMinChargeSeconds());
+  Serial.println(" detik");
+
+  Serial.println("==============================================");
+}
+
+// ================= BLE CALLBACK =================
+void parseNotify(uint8_t* data, size_t len) {
+  // Protokol baru: notification BLE digabung dulu sampai full frame 300 byte,
+  // lalu seluruh data BMS, termasuk SoC byte 173, diparse dari frame realtime 0x02.
+  assembleBMSFrame(data, len);
+}
+
+void notifyCallback(
+  NimBLERemoteCharacteristic* ch,
+  uint8_t* data,
+  size_t len,
+  bool isNotify
+) {
+  parseNotify(data, len);
+}
+
+// ================= BLE CONNECT =================
+bool connectToBMS() {
+  Serial.println("Scanning...");
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+
+  NimBLEScanResults results = scan->getResults(15000);
+
+  const NimBLEAdvertisedDevice* target = nullptr;
+
+  for (int i = 0; i < results.getCount(); i++) {
+    const NimBLEAdvertisedDevice* dev = results.getDevice(i);
+    String addr = dev->getAddress().toString().c_str();
+
+    if (addr.equalsIgnoreCase(TARGET_ADDR)) {
+      target = dev;
+      Serial.println("BMS found.");
+      break;
+    }
+  }
+
+  if (target == nullptr) {
+    Serial.println("BMS not found.");
+    scan->clearResults();
+    return false;
+  }
+
+  client = NimBLEDevice::createClient();
+
+  Serial.println("Connecting...");
+  if (!client->connect(target)) {
+    Serial.println("Connect failed.");
+    scan->clearResults();
+    return false;
+  }
+
+  Serial.println("Connected.");
+
+  NimBLERemoteService* service = client->getService("ffe0");
+  if (!service) {
+    Serial.println("Service FFE0 not found.");
+    client->disconnect();
+    scan->clearResults();
+    return false;
+  }
+
+  dataChar = service->getCharacteristic("ffe1");
+  if (!dataChar) {
+    Serial.println("FFE1 not found.");
+    client->disconnect();
+    scan->clearResults();
+    return false;
+  }
+
+  if (!dataChar->subscribe(true, notifyCallback)) {
+    Serial.println("Subscribe failed.");
+    client->disconnect();
+    scan->clearResults();
+    return false;
+  }
+
+  Serial.println("Subscribed to notify.");
+  scan->clearResults();
+  return true;
+}
+
+void sendFrame(uint8_t* frame, size_t len, const char* label) {
+  if (!client || !client->isConnected() || !dataChar) return;
+
+  bool ok = dataChar->writeValue(frame, len, true);
+
+  Serial.print(label);
+  Serial.print(" sent: ");
+  Serial.println(ok ? "OK" : "FAILED");
+}
+
+void sendInitialSequence() {
+  sendFrame(requestSettings, sizeof(requestSettings), "Request 0x96 Settings");
+  delay(1000);
+  sendFrame(requestDeviceInfo, sizeof(requestDeviceInfo), "Request 0x97 DeviceInfo");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(RELAY_LOAD_PIN, OUTPUT);
+  pinMode(RELAY_CHARGE_PIN, OUTPUT);
+  pinMode(RELAY_RESISTOR_PIN, OUTPUT);
+
+  allRelayOff();
+
+  Serial.println("ESP1 JK BMS + FULL RELAY CONTROL + MQTT COMMAND FOR ESP2");
+
+  wifiClient.setInsecure();
+
+  setupWiFi();
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.google.com");
+  updateSystemAllowed();
+  setupMQTT();
+
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  if (connectToBMS()) {
+    delay(1000);
+    sendInitialSequence();
+  }
+}
+
+// ================= LOOP =================
+void loop() {
+  static unsigned long lastRequest = 0;
+  static unsigned long lastPrint = 0;
+  static unsigned long lastControl = 0;
+
+  maintainWiFi();
+  maintainMQTT();
+
+  if (client && client->isConnected()) {
+    if (millis() - lastRequest > 30000) {
+      lastRequest = millis();
+      sendInitialSequence();
+    }
+
+    if (millis() - lastControl > 500) {
+      lastControl = millis();
+      controlRelays();
+      updateLoadStage();
+    }
+
+    publishMQTTData();
+    publishESP2Command();
+
+    if (millis() - lastPrint > 5000) {
+      lastPrint = millis();
+      printDataForControl();
+    }
+  } else {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+
+    Serial.println("BMS disconnected. Relay OFF. Restart ESP32 or improve BLE connection.");
+    delay(5000);
+  }
+}
