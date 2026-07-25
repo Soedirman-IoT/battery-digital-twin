@@ -246,7 +246,8 @@ const float PACK_CHARGE_START_V = CHARGE_START_CELL_V * 6;
 const float PACK_CHARGE_STOP_V  = CHARGE_STOP_CELL_V * 6;
 const float TEMP_OFF_C = 55.0;
 
-const unsigned long RELAY_SWITCH_DELAY_MS = 300000;
+const unsigned long TO_CHARGE_DELAY_MS = 3000;      // 3 detik
+const unsigned long TO_LOAD_DELAY_MS   = 300000;    // 5 menit
 
 // Minimum waktu charge.
 // Tujuannya agar setelah relay charge sempat ON, sistem tidak langsung pindah ke relay beban
@@ -1270,7 +1271,7 @@ void controlRelays() {
         break;
       }
 
-      if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
+      if (now - transitionStart >= TO_CHARGE_DELAY_MS) {
         chargeRelayOn = true;
         loadRelayOn = false;
 
@@ -1337,7 +1338,7 @@ void controlRelays() {
         break;
       }
 
-      if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
+      if (now - transitionStart >= TO_LOAD_DELAY_MS) {
         loadRelayOn = true;
         chargeRelayOn = false;
         systemMode = MODE_LOAD;
