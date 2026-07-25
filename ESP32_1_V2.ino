@@ -240,13 +240,13 @@ const float CHARGE_STOP_SOC  = 95.0;   // berhenti charge saat SoC >=95%
 
 // Emergency protection (tetap dipakai)
 const float CHARGE_START_CELL_V = 3.0;
-const float CHARGE_STOP_CELL_V  = 4.2;
+const float CHARGE_STOP_CELL_V  = 4.15;
 
-const float PACK_CHARGE_START_V = 18.0;
-const float PACK_CHARGE_STOP_V  = 25.2;
+const float PACK_CHARGE_START_V = CHARGE_START_CELL_V * 6;
+const float PACK_CHARGE_STOP_V  = CHARGE_STOP_CELL_V * 6;
 const float TEMP_OFF_C = 55.0;
 
-const unsigned long RELAY_SWITCH_DELAY_MS = 3000;
+const unsigned long RELAY_SWITCH_DELAY_MS = 300000;
 
 // Minimum waktu charge.
 // Tujuannya agar setelah relay charge sempat ON, sistem tidak langsung pindah ke relay beban
@@ -491,13 +491,9 @@ void updateBatteryThresholdState() {
   // ======================
   else {
 
-    batteryLowRaw =
-        minCellVoltage <= CHARGE_START_CELL_V ||
-        packVoltage <= PACK_CHARGE_START_V;
+    batteryLowRaw = packVoltage <= PACK_CHARGE_START_V;
 
-    batteryFullRaw =
-        maxCellVoltage >= CHARGE_STOP_CELL_V ||
-        packVoltage >= PACK_CHARGE_STOP_V;
+    batteryFullRaw = packVoltage >= PACK_CHARGE_STOP_V;
   }
 
   if (batteryLowRaw) {
