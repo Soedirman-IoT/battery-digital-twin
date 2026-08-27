@@ -5,6 +5,7 @@
 #include "esp_eap_client.h"
 #include <time.h>
 #include <vector>
+#include "esp_system.h"
 
 // =====================================================
 // WIFI WPA2 ENTERPRISE + MQTT CONFIG
@@ -25,6 +26,12 @@ const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
 const char* MQTT_TOPIC_DATA   = "skripsi/bms01/data";
 const char* MQTT_TOPIC_STATUS = "skripsi/bms01/status";
 const char* MQTT_TOPIC_CONTROL = "skripsi/bms01/control";
+
+volatile uint32_t bleDisconnectCount = 0;
+volatile uint32_t bleReconnectCount = 0;
+volatile uint32_t bleNotifyCount = 0;
+volatile uint32_t bmsValidFrameCount = 0;
+volatile uint32_t bmsCrcErrorCount = 0;
 
 // Topic ini dipakai ESP1 untuk memberi izin/larangan kerja ke ESP2.
 // ESP2 cukup subscribe topic ini, lalu menjalankan DST-WLTC hanya saat motor_enable=true.
@@ -957,6 +964,7 @@ void updateFromFullJKFrame(const uint8_t* data, size_t len) {
   uint8_t computedCRC = calcJKCRC(data, JK_FRAME_SIZE - 1);
   uint8_t remoteCRC = data[JK_FRAME_SIZE - 1];
   if (computedCRC != remoteCRC) {
+    bmsCrcErrorCount++;
     Serial.print("CRC frame BMS gagal: computed=0x");
     Serial.print(computedCRC, HEX);
     Serial.print(" remote=0x");
@@ -1046,6 +1054,7 @@ void updateFromFullJKFrame(const uint8_t* data, size_t len) {
   }
 
   lastBMSDataTime = millis();
+  bmsValidFrameCount++;
 }
 
 void assembleBMSFrame(uint8_t* data, size_t len) {
@@ -1494,10 +1503,27 @@ void printDataForControl() {
   Serial.println("==============================================");
 }
 
+// ================= BLE CONNECTION MANAGER =================
+// BLE dijalankan di task terpisah supaya proses scan/reconnect BMS
+// tidak menghentikan loop utama yang menangani Wi-Fi + MQTT.
+enum BLEState {
+  BLE_DISCONNECTED,
+  BLE_CONNECTING,
+  BLE_CONNECTED
+};
+
+volatile BLEState bleState = BLE_DISCONNECTED;
+volatile bool bmsBleConnected = false;
+
+unsigned long lastBLEReconnectAttempt = 0;
+const unsigned long BLE_RECONNECT_INTERVAL_MS = 30000; // 30 detik
+
+TaskHandle_t bleTaskHandle = nullptr;
+
 // ================= BLE CALLBACK =================
 void parseNotify(uint8_t* data, size_t len) {
-  // Protokol baru: notification BLE digabung dulu sampai full frame 300 byte,
-  // lalu seluruh data BMS, termasuk SoC byte 173, diparse dari frame realtime 0x02.
+  // Notification BLE digabung sampai full frame 300 byte,
+  // kemudian seluruh data BMS diparse dari frame realtime 0x02.
   assembleBMSFrame(data, len);
 }
 
@@ -1507,18 +1533,36 @@ void notifyCallback(
   size_t len,
   bool isNotify
 ) {
+  bleNotifyCount++;
   parseNotify(data, len);
+}
+
+// ================= BLE CLEANUP =================
+void cleanupBMSClient() {
+  dataChar = nullptr;
+
+  if (client && client->isConnected()) {
+    client->disconnect();
+  }
+
+  // Client sengaja TIDAK dihapus. NimBLE-Arduino merekomendasikan
+  // reuse client untuk koneksi berulang ke perangkat yang sama karena
+  // service/characteristic cache dapat dipakai kembali dan heap lebih stabil.
+  bmsFrameBuffer.clear();
 }
 
 // ================= BLE CONNECT =================
 bool connectToBMS() {
-  Serial.println("Scanning...");
+  Serial.println("[BLE] Scanning BMS...");
 
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(99);
 
+  // Tetap menggunakan API scan yang sudah terbukti bekerja pada kode lu.
+  // Karena fungsi ini dijalankan di BLE task terpisah, scan 15 detik
+  // tidak menghentikan loop MQTT utama.
   NimBLEScanResults results = scan->getResults(15000);
 
   const NimBLEAdvertisedDevice* target = nullptr;
@@ -1529,76 +1573,232 @@ bool connectToBMS() {
 
     if (addr.equalsIgnoreCase(TARGET_ADDR)) {
       target = dev;
-      Serial.println("BMS found.");
+      Serial.println("[BLE] BMS found.");
       break;
     }
   }
 
   if (target == nullptr) {
-    Serial.println("BMS not found.");
+    Serial.println("[BLE] BMS not found.");
     scan->clearResults();
     return false;
   }
 
-  client = NimBLEDevice::createClient();
+  // Gunakan satu object client dan reuse untuk reconnect berikutnya.
+  bool firstConnection = false;
 
-  Serial.println("Connecting...");
-  if (!client->connect(target)) {
-    Serial.println("Connect failed.");
+  if (!client) {
+    client = NimBLEDevice::createClient();
+
+    if (!client) {
+      Serial.println("[BLE] Failed to create client.");
+      scan->clearResults();
+      return false;
+    }
+
+    // Timeout koneksi dibuat lebih pendek supaya satu percobaan gagal
+    // tidak menahan task BLE terlalu lama.
+    client->setConnectTimeout(5000);
+    firstConnection = true;
+  }
+
+  Serial.println("[BLE] Connecting to BMS...");
+
+  bool connectedOK;
+
+  if (firstConnection) {
+    connectedOK = client->connect(target);
+  } else {
+    // Pada reconnect, gunakan cache service/characteristic yang sudah
+    // diketahui sebelumnya sehingga proses lebih ringan.
+    connectedOK = client->connect(target, false);
+  }
+
+  if (!connectedOK) {
+    Serial.println("[BLE] Connect failed.");
     scan->clearResults();
+    dataChar = nullptr;
+    bmsFrameBuffer.clear();
     return false;
   }
 
-  Serial.println("Connected.");
+  Serial.println("[BLE] Connected.");
 
   NimBLERemoteService* service = client->getService("ffe0");
   if (!service) {
-    Serial.println("Service FFE0 not found.");
-    client->disconnect();
+    Serial.println("[BLE] Service FFE0 not found.");
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
   dataChar = service->getCharacteristic("ffe1");
   if (!dataChar) {
-    Serial.println("FFE1 not found.");
-    client->disconnect();
+    Serial.println("[BLE] Characteristic FFE1 not found.");
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
   if (!dataChar->subscribe(true, notifyCallback)) {
-    Serial.println("Subscribe failed.");
-    client->disconnect();
+    Serial.println("[BLE] Subscribe failed.");
     scan->clearResults();
+    cleanupBMSClient();
     return false;
   }
 
-  Serial.println("Subscribed to notify.");
+  Serial.println("[BLE] Subscribed to notify.");
+
   scan->clearResults();
+  bmsFrameBuffer.clear();
   return true;
 }
 
 void sendFrame(uint8_t* frame, size_t len, const char* label) {
-  if (!client || !client->isConnected() || !dataChar) return;
+  if (!client || !client->isConnected() || !dataChar) {
+    Serial.print("[BLE] ");
+    Serial.print(label);
+    Serial.println(" skipped: BMS not connected.");
+    return;
+  }
 
   bool ok = dataChar->writeValue(frame, len, true);
 
+  Serial.print("[BLE] ");
   Serial.print(label);
   Serial.print(" sent: ");
   Serial.println(ok ? "OK" : "FAILED");
 }
 
+// ================= BLE INITIAL REQUEST =================
+// Fungsi ini dijalankan di BLE task, jadi delay 1 detik di sini
+// tidak menghentikan MQTT loop utama.
 void sendInitialSequence() {
-  sendFrame(requestSettings, sizeof(requestSettings), "Request 0x96 Settings");
-  delay(1000);
-  sendFrame(requestDeviceInfo, sizeof(requestDeviceInfo), "Request 0x97 DeviceInfo");
+  if (!client || !client->isConnected() || !dataChar) return;
+
+  sendFrame(
+    requestSettings,
+    sizeof(requestSettings),
+    "Request 0x96 Settings"
+  );
+
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // Cek lagi setelah 1 detik. Kalau BLE ternyata disconnect,
+  // jangan mencoba menulis ke characteristic yang sudah invalid.
+  if (!client || !client->isConnected() || !dataChar) {
+    Serial.println("[BLE] Connection lost before Request 0x97.");
+    return;
+  }
+
+  sendFrame(
+    requestDeviceInfo,
+    sizeof(requestDeviceInfo),
+    "Request 0x97 DeviceInfo"
+  );
+}
+
+// ================= BLE TASK =================
+void bleConnectionTask(void* parameter) {
+  bool previousConnected = false;
+
+  for (;;) {
+
+    bool connected = (client != nullptr && client->isConnected());
+
+    // =====================================================
+    // CONNECTION TERPUTUS
+    // =====================================================
+    if (!connected) {
+
+      if (previousConnected || bmsBleConnected) {
+        Serial.println("[BLE] BMS disconnected.");
+        bleDisconnectCount++;
+
+        bmsBleConnected = false;
+        bleState = BLE_DISCONNECTED;
+
+        // Jangan biarkan data BMS lama dianggap masih valid ketika
+        // BLE sedang reconnect.
+        lastBMSDataTime = 0;
+        voltageValid = false;
+        currentValid = false;
+        balanceCurrentValid = false;
+        tempValid = false;
+        socValid = false;
+
+        // Safety flag ditangani oleh loop utama.
+        // BLE task tidak menulis relay agar tidak ada akses bersamaan
+        // ke state kontrol dengan loop utama.
+
+        // Bersihkan client lama dan buffer frame.
+        cleanupBMSClient();
+      }
+
+      previousConnected = false;
+
+      unsigned long now = millis();
+
+      // Jangan scan terus-menerus. Beri jeda 30 detik antar percobaan.
+      if (now - lastBLEReconnectAttempt >= BLE_RECONNECT_INTERVAL_MS) {
+
+        lastBLEReconnectAttempt = now;
+        bleState = BLE_CONNECTING;
+
+        Serial.println("[BLE] Attempting automatic reconnect...");
+
+        bool ok = connectToBMS();
+
+        if (ok) {
+          bmsBleConnected = true;
+          bleState = BLE_CONNECTED;
+          bleReconnectCount++;
+          previousConnected = true;
+          Serial.println("[BLE] Automatic reconnect SUCCESS.");
+
+          // Request awal dijalankan di task BLE, bukan di loop MQTT.
+          sendInitialSequence();
+        } else {
+          bmsBleConnected = false;
+          bleState = BLE_DISCONNECTED;
+          Serial.println("[BLE] Automatic reconnect FAILED. Will retry later.");
+        }
+      }
+
+      // Task tidur supaya tidak membebani CPU.
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    // =====================================================
+    // CONNECTION MASIH AKTIF
+    // =====================================================
+    if (connected) {
+      bmsBleConnected = true;
+      bleState = BLE_CONNECTED;
+      previousConnected = true;
+
+      // Request BMS setiap 30 detik.
+      // Timer ini berada di task BLE sehingga loop MQTT tidak terganggu.
+      static unsigned long lastBMSRequest = 0;
+
+      if (millis() - lastBMSRequest >= 30000) {
+        lastBMSRequest = millis();
+        sendInitialSequence();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 }
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  Serial.print("Reset reason: ");
+  Serial.println((int)esp_reset_reason());
 
   pinMode(RELAY_LOAD_PIN, OUTPUT);
   pinMode(RELAY_CHARGE_PIN, OUTPUT);
@@ -1618,26 +1818,34 @@ void setup() {
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-  if (connectToBMS()) {
-    delay(1000);
-    sendInitialSequence();
-  }
+  // BLE connection manager dijalankan sebagai FreeRTOS task terpisah.
+  // Dengan demikian scan/reconnect BLE tidak menghentikan loop MQTT.
+  xTaskCreate(
+    bleConnectionTask,
+    "BLE_Manager",
+    8192,
+    nullptr,
+    1,
+    &bleTaskHandle
+  );
 }
 
 // ================= LOOP =================
 void loop() {
-  static unsigned long lastRequest = 0;
   static unsigned long lastPrint = 0;
   static unsigned long lastControl = 0;
 
+  // =====================================================
+  // 1. Wi-Fi dan MQTT SELALU dilayani oleh loop utama.
+  //    BLE scan/reconnect berjalan di task terpisah.
+  // =====================================================
   maintainWiFi();
   maintainMQTT();
 
-  if (client && client->isConnected()) {
-    if (millis() - lastRequest > 30000) {
-      lastRequest = millis();
-      sendInitialSequence();
-    }
+  // =====================================================
+  // 2. Jika BLE connected, jalankan kontrol + publish.
+  // =====================================================
+  if (bmsBleConnected) {
 
     if (millis() - lastControl > 500) {
       lastControl = millis();
@@ -1648,15 +1856,70 @@ void loop() {
     publishMQTTData();
     publishESP2Command();
 
-    if (millis() - lastPrint > 5000) {
-      lastPrint = millis();
-      printDataForControl();
-    }
   } else {
+
+    // BLE BMS tidak tersedia -> semua relay OFF.
+    // TIDAK ADA delay() di sini.
+    // Loop langsung kembali ke maintainWiFi()/maintainMQTT().
     systemMode = MODE_SAFE_OFF;
     allRelayOff();
-
-    Serial.println("BMS disconnected. Relay OFF. Restart ESP32 or improve BLE connection.");
-    delay(5000);
   }
+
+  // =====================================================
+  // 3. Status monitoring setiap 5 detik.
+  // =====================================================
+  if (millis() - lastPrint > 5000) {
+    lastPrint = millis();
+
+    printDataForControl();
+
+    Serial.print("BLE State             : ");
+    switch (bleState) {
+      case BLE_CONNECTED:
+        Serial.println("CONNECTED");
+        break;
+      case BLE_CONNECTING:
+        Serial.println("CONNECTING");
+        break;
+      default:
+        Serial.println("DISCONNECTED");
+        break;
+    }
+
+    Serial.print("BLE Disconnect Count   : ");
+    Serial.println(bleDisconnectCount);
+
+    Serial.print("BLE Reconnect Count    : ");
+    Serial.println(bleReconnectCount);
+
+    Serial.print("Free Heap              : ");
+    Serial.println(ESP.getFreeHeap());
+
+    Serial.print("Minimum Free Heap      : ");
+    Serial.println(ESP.getMinFreeHeap());
+
+    Serial.print("BLE Notify Count       : ");
+    Serial.println(bleNotifyCount);
+
+    Serial.print("BMS Valid Frame Count  : ");
+    Serial.println(bmsValidFrameCount);
+
+    Serial.print("BMS CRC Error Count    : ");
+    Serial.println(bmsCrcErrorCount);
+
+    Serial.print("BMS Last Data Age      : ");
+    if (lastBMSDataTime == 0) {
+      Serial.println("NEVER");
+    } else {
+      Serial.print((millis() - lastBMSDataTime) / 1000UL);
+      Serial.println(" s");
+    }
+
+    Serial.println("==============================================");
+  }
+
+  // Jangan gunakan delay panjang di loop.
+  // Task scheduler tetap diberi kesempatan bekerja.
+  delay(1);
 }
+
