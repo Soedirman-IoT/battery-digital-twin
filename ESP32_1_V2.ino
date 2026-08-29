@@ -253,8 +253,8 @@ const float PACK_CHARGE_START_V = CHARGE_START_CELL_V * 6;
 const float PACK_CHARGE_STOP_V  = CHARGE_STOP_CELL_V * 6;
 const float TEMP_OFF_C = 55.0;
 
-const unsigned long TO_CHARGE_DELAY_MS = 3000;      // 3 detik
-const unsigned long TO_LOAD_DELAY_MS   = 300000;    // 5 menit
+const unsigned long TO_CHARGE_DELAY_MS = 300000;      // 5 menit
+const unsigned long TO_LOAD_DELAY_MS   = 600000;    // 10 menit
 
 // Minimum waktu charge.
 // Tujuannya agar setelah relay charge sempat ON, sistem tidak langsung pindah ke relay beban
