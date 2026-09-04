@@ -88,8 +88,8 @@ float positionDegree = 0.0;
 float totalRevolution = 0.0;
 
 // ================= SENSOR CONFIG =================
-const int I2C_SDA_PIN = 23;
-const int I2C_SCL_PIN = 22;
+const int I2C_SDA_PIN = 26;
+const int I2C_SCL_PIN = 27;
 
 // Pastikan address INA219 berbeda via jumper A0/A1.
 const uint8_t INA219_U_ADDR = 0x40;
@@ -447,11 +447,9 @@ void updateLm35Sensor() {
   }
   float rawAvg = (float)rawSum / (float)LM35_SAMPLE_COUNT;
   float voltage = (rawAvg / ADC_MAX_COUNT) * ADC_REF_V;
-  float tempBaru = (voltage * 100.0) + 5;
+  float tempBaru = (voltage * 100.0) + 13.2;
 
-  motorDcTempC =
-  0.9 * motorDcTempC +
-  0.1 * tempBaru;
+  motorDcTempC = tempBaru;
 }
 
 void setupAdxl345() {
