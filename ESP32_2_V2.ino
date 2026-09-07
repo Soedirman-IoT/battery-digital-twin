@@ -38,7 +38,6 @@ const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
 const char* MQTT_TOPIC_MOTOR_CMD    = "skripsi/motor01/cmd";
 const char* MQTT_TOPIC_MOTOR_DATA   = "skripsi/motor01/data";
 const char* MQTT_TOPIC_MOTOR_STATUS = "skripsi/motor01/status";
-const char* MQTT_TOPIC_MEASUREMENT_STREAM = "measurement_stream";
 
 unsigned long wifiDisconnectedSince = 0;
 const unsigned long WIFI_RESTART_TIMEOUT_MS = 120000; // 2 menit
@@ -91,6 +90,27 @@ float totalRevolution = 0.0;
 const int I2C_SDA_PIN = 26;
 const int I2C_SCL_PIN = 27;
 
+// ================= I2C / ADXL345 ERROR HANDLING =================
+const uint32_t I2C_CLOCK_HZ = 100000;       // 100 kHz
+const uint16_t I2C_TIMEOUT_MS = 20;         // timeout transaksi I2C
+
+const uint8_t ADXL345_I2C_ADDR = 0x53;
+const uint8_t ADXL345_DEVID_REG = 0x00;
+const uint8_t ADXL345_EXPECTED_DEVID = 0xE5;
+
+// Batas fisik ADXL345 pada range ±16 g
+const float ADXL345_MAX_VALID_MS2 = 160.0;
+
+// Recovery hanya setelah beberapa error berturut-turut
+const uint8_t ADXL345_MAX_CONSECUTIVE_ERRORS = 5;
+
+// Agar tidak initialize berulang-ulang terlalu cepat
+const unsigned long ADXL345_RECOVERY_INTERVAL_MS = 5000;
+
+uint8_t adxlConsecutiveErrors = 0;
+unsigned long lastAdxlRecoveryMs = 0;
+unsigned long adxlTotalErrors = 0;
+
 // Pastikan address INA219 berbeda via jumper A0/A1.
 const uint8_t INA219_U_ADDR = 0x40;
 const uint8_t INA219_V_ADDR = 0x41;
@@ -130,15 +150,11 @@ float vuvVoltageAvg = 0.0;
 float vuwVoltageAvg = 0.0;
 float vvwVoltageAvg = 0.0;
 
-String motorCondition = "NORMAL";
-// ambang perbedaan arus (A)
-const float CURRENT_FAULT_THRESHOLD = 0.5;
-
 // LM35 = 10 mV/°C. Gunakan ADC1 karena WiFi aktif.
 const int LM35_PIN = 32;
 const float ADC_REF_V = 3.30;
 const float ADC_MAX_COUNT = 4095.0;
-const int LM35_SAMPLE_COUNT = 60;
+const int LM35_SAMPLE_COUNT = 50;
 float motorDcTempC = 0.0;
 
 Adafruit_ADXL345_Unified adxl = Adafruit_ADXL345_Unified(12345);
@@ -329,25 +345,9 @@ void updateWltcControl() {
   }
 
   setMotorEnablePin(true);
-
-  if (loadStage == "FULL_SPEED"){
-    // Motor selalu berputar maksimum
-    wltcSpeedKmh = WLTC_MAX_SPEED_KMH;   // hanya untuk tampilan Grafana
-    rpmSetpoint = MOTOR_MAX_RPM;
-  }
-  else if (loadStage == "WLTC" || loadStage == "WLTC_DUMMY"){
-    // Jalankan profil WLTC seperti biasa
-    wltcSecond = (millis() / 1000UL) % WLTC_CYCLE_SECONDS;
-
-    wltcSpeedKmh = interpolateWltcSpeed(wltcSecond);
-
-    rpmSetpoint = mapSpeedToRpm(wltcSpeedKmh);
-  }
-  else{
-    rpmSetpoint = 0;
-    wltcSpeedKmh = 0;
-  }
-
+  wltcSecond = (millis() / 1000UL) % WLTC_CYCLE_SECONDS;
+  wltcSpeedKmh = interpolateWltcSpeed(wltcSecond);
+  rpmSetpoint = mapSpeedToRpm(wltcSpeedKmh);
   targetPotStep = mapRpmToPotStep(rpmSetpoint);
   x9cSetStep(targetPotStep);
 }
@@ -411,34 +411,6 @@ void updateIna219Sensors() {
   phaseTotalPowerAvg = phaseUPowerAvg + phaseVPowerAvg + phaseWPowerAvg;
 }
 
-void updateMotorCondition() {
-
-  float c_u = phaseUCurrentAvg;
-  float c_v = phaseVCurrentAvg;
-  float c_w = phaseWCurrentAvg;
-
-  if ((c_u - c_v) > CURRENT_FAULT_THRESHOLD) {
-
-    motorCondition = "UV Fault";
-
-  }
-  else if ((c_v - c_w) > CURRENT_FAULT_THRESHOLD) {
-
-    motorCondition = "VW Fault";
-
-  }
-  else if ((c_w - c_u) > CURRENT_FAULT_THRESHOLD) {
-
-    motorCondition = "WU Fault";
-
-  }
-  else {
-
-    motorCondition = "NORMAL";
-
-  }
-}
-
 void updateLm35Sensor() {
   uint32_t rawSum = 0;
   for (int i = 0; i < LM35_SAMPLE_COUNT; i++) {
@@ -447,57 +419,291 @@ void updateLm35Sensor() {
   }
   float rawAvg = (float)rawSum / (float)LM35_SAMPLE_COUNT;
   float voltage = (rawAvg / ADC_MAX_COUNT) * ADC_REF_V;
-  float tempBaru = (voltage * 100.0) + 13.2;
+  float tempBaru = (voltage * 100.0) + 16;
 
-  motorDcTempC = tempBaru;
+  motorDcTempC =
+  0.9 * motorDcTempC +
+  0.1 * tempBaru;
 }
 
+bool checkAdxl345Device() {
+  Wire.beginTransmission(ADXL345_I2C_ADDR);
+  Wire.write(ADXL345_DEVID_REG);
+
+  uint8_t error = Wire.endTransmission(false);
+
+  if (error != 0) {
+    return false;
+  }
+
+  uint8_t received = Wire.requestFrom(
+    ADXL345_I2C_ADDR,
+    (uint8_t)1
+  );
+
+  if (received != 1) {
+    return false;
+  }
+
+  uint8_t deviceId = Wire.read();
+
+  return (deviceId == ADXL345_EXPECTED_DEVID);
+}
+
+
+bool initializeAdxl345() {
+
+  if (!checkAdxl345Device()) {
+    Serial.println("[ADXL345] Device ID check FAILED.");
+    return false;
+  }
+
+  if (!adxl.begin()) {
+    Serial.println("[ADXL345] Library initialization FAILED.");
+    return false;
+  }
+
+  adxl.setRange(ADXL345_RANGE_16_G);
+
+  Serial.println("[ADXL345] Initialized successfully.");
+
+  return true;
+}
+
+
 void setupAdxl345() {
-  adxlReady = adxl.begin();
+
+  adxlReady = initializeAdxl345();
+
   if (!adxlReady) {
-    Serial.println("ADXL345 not detected. Check wiring/address.");
+    Serial.println("[ADXL345] NOT READY.");
     return;
   }
-  adxl.setRange(ADXL345_RANGE_16_G);
-  Serial.println("ADXL345 detected and initialized.");
+
+  Serial.println("[ADXL345] Ready.");
 }
 
 void updateAdxl345Sensor() {
+
+  // =====================================================
+  // ADXL345 tidak siap
+  // =====================================================
   if (!adxlReady) {
-    accelX = accelY = accelZ = accelMagnitude = vibrationRms = vibrationPeak = 0.0;
+
+    // Coba recovery secara periodik
+    unsigned long now = millis();
+
+    if (now - lastAdxlRecoveryMs >= ADXL345_RECOVERY_INTERVAL_MS) {
+
+      lastAdxlRecoveryMs = now;
+
+      Serial.println("[ADXL345] Attempting recovery...");
+
+      if (initializeAdxl345()) {
+
+        adxlReady = true;
+        adxlConsecutiveErrors = 0;
+
+        Serial.println("[ADXL345] Recovery SUCCESS.");
+
+      } else {
+
+        adxlReady = false;
+
+        Serial.println("[ADXL345] Recovery FAILED.");
+      }
+    }
+
     return;
   }
 
+
+  // =====================================================
+  // Sampling
+  // =====================================================
   const int sampleCount = 25;
+
   float sumSq = 0.0;
   float peak = 0.0;
+
+  int validSamples = 0;
+
+  float lastValidX = accelX;
+  float lastValidY = accelY;
+  float lastValidZ = accelZ;
+  float lastValidMagnitude = accelMagnitude;
+
   sensors_event_t event;
 
+
   for (int i = 0; i < sampleCount; i++) {
+
+    // ---------------------------------------------------
+    // Baca ADXL345
+    // ---------------------------------------------------
     adxl.getEvent(&event);
+
     float x = event.acceleration.x;
     float y = event.acceleration.y;
     float z = event.acceleration.z;
-    float mag = sqrt(x * x + y * y + z * z);
+
+
+    // ---------------------------------------------------
+    // Validasi nilai
+    // ---------------------------------------------------
+
+    bool validData = true;
+
+    // Cek NaN / infinity
+    if (!isfinite(x) ||
+        !isfinite(y) ||
+        !isfinite(z)) {
+
+      validData = false;
+    }
+
+
+    // Cek batas fisik ±16g
+    if (fabs(x) > ADXL345_MAX_VALID_MS2 ||
+        fabs(y) > ADXL345_MAX_VALID_MS2 ||
+        fabs(z) > ADXL345_MAX_VALID_MS2) {
+
+      validData = false;
+    }
+
+
+    // ---------------------------------------------------
+    // Kalau data invalid → jangan dipakai
+    // ---------------------------------------------------
+    if (!validData) {
+
+      adxlTotalErrors++;
+
+      Serial.println(
+        "[ADXL345] INVALID DATA detected!"
+      );
+
+      delayMicroseconds(1000);
+
+      continue;
+    }
+
+
+    // ---------------------------------------------------
+    // Data valid
+    // ---------------------------------------------------
+    float mag = sqrt(
+      x * x +
+      y * y +
+      z * z
+    );
+
     float vib = mag - accelMagnitudeBaseline;
 
     sumSq += vib * vib;
-    if (fabs(vib) > peak) peak = fabs(vib);
 
-    if (i == sampleCount - 1) {
-      accelX = x;
-      accelY = y;
-      accelZ = z;
-      accelMagnitude = mag;
+    if (fabs(vib) > peak) {
+      peak = fabs(vib);
     }
+
+    validSamples++;
+
+    lastValidX = x;
+    lastValidY = y;
+    lastValidZ = z;
+    lastValidMagnitude = mag;
+
+
     delayMicroseconds(1000);
   }
 
+
+  // =====================================================
+  // Tidak ada sample valid
+  // =====================================================
+  if (validSamples == 0) {
+
+    adxlConsecutiveErrors++;
+
+    Serial.print(
+      "[ADXL345] No valid sample. Error count = "
+    );
+
+    Serial.println(adxlConsecutiveErrors);
+
+
+    // Recovery setelah error berturut-turut
+    if (adxlConsecutiveErrors >=
+        ADXL345_MAX_CONSECUTIVE_ERRORS) {
+
+      unsigned long now = millis();
+
+      if (now - lastAdxlRecoveryMs >=
+          ADXL345_RECOVERY_INTERVAL_MS) {
+
+        lastAdxlRecoveryMs = now;
+
+        Serial.println(
+          "[ADXL345] Too many errors. Reinitializing..."
+        );
+
+        adxlReady = initializeAdxl345();
+
+        if (adxlReady) {
+
+          adxlConsecutiveErrors = 0;
+
+          Serial.println(
+            "[ADXL345] Reinitialization SUCCESS."
+          );
+
+        } else {
+
+          Serial.println(
+            "[ADXL345] Reinitialization FAILED."
+          );
+        }
+      }
+    }
+
+    // PENTING:
+    // Pertahankan data valid terakhir.
+    return;
+  }
+
+
+  // =====================================================
+  // Minimal satu sample valid
+  // =====================================================
+
+  accelX = lastValidX;
+  accelY = lastValidY;
+  accelZ = lastValidZ;
+  accelMagnitude = lastValidMagnitude;
+
+
+  // Karena berhasil membaca data valid,
+  // reset counter error berturut-turut.
+  adxlConsecutiveErrors = 0;
+
+
+  // =====================================================
+  // Update baseline
+  // =====================================================
+
   accelMagnitudeBaseline =
     (VIBRATION_BASELINE_ALPHA * accelMagnitude) +
-    ((1.0 - VIBRATION_BASELINE_ALPHA) * accelMagnitudeBaseline);
+    ((1.0 - VIBRATION_BASELINE_ALPHA)
+     * accelMagnitudeBaseline);
 
-  vibrationRms = sqrt(sumSq / (float)sampleCount);
+
+  // =====================================================
+  // Hitung RMS dan Peak
+  // =====================================================
+
+  vibrationRms =
+    sqrt(sumSq / (float)validSamples);
+
   vibrationPeak = peak;
 }
 
@@ -812,44 +1018,6 @@ void publishMotorData() {
   bool ok = mqttClient.publish(MQTT_TOPIC_MOTOR_DATA, payload, false);
   Serial.print("MQTT motor publish: ");
   Serial.println(ok ? "OK" : "FAILED");
-
-  char measurementPayload[512];
-  snprintf(
-    measurementPayload,
-    sizeof(measurementPayload),
-    "{"
-      "\"timestamp\":%lu,"
-      "\"motor_condition\":\"%s\","
-      "\"speed\":%.1f,"
-      "\"temperature\":%.2f,"
-      "\"current_u\":%.3f,"
-      "\"current_v\":%.3f,"
-      "\"current_w\":%.3f,"
-      "\"voltage_u\":%.3f,"
-      "\"voltage_v\":%.3f,"
-      "\"voltage_w\":%.3f,"
-      "\"vibration_x\":%.3f,"
-      "\"vibration_y\":%.3f,"
-      "\"vibration_z\":%.3f"
-    "}",
-    millis(),
-    motorCondition.c_str(),
-    rpmFiltered,
-    motorDcTempC,
-    phaseUCurrentAvg,
-    phaseVCurrentAvg,
-    phaseWCurrentAvg,
-    phaseUVoltageAvg,
-    phaseVVoltageAvg,
-    phaseWVoltageAvg,
-    accelX,
-    accelY,
-    accelZ
-  );
-
-  bool ok2 = mqttClient.publish(MQTT_TOPIC_MEASUREMENT_STREAM, measurementPayload, false);
-  Serial.print("MQTT MEASUREMENT_STREAM publish: ");
-  Serial.println(ok ? "OK" : "FAILED");
 }
 
 void printMotorData() {
@@ -904,6 +1072,13 @@ void setup() {
   analogSetPinAttenuation(LM35_PIN, ADC_11db);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // Komunikasi I2C dibuat lebih konservatif untuk lingkungan BLDC
+  Wire.setClock(I2C_CLOCK_HZ);
+
+  // Hindari bus menggantung terlalu lama ketika ada gangguan
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+
   setupIna219();
   setupAdxl345();
 
@@ -934,7 +1109,6 @@ void loop() {
     lastSensor = now;
     updateRpm();
     updateIna219Sensors();
-    updateMotorCondition();
     updateLm35Sensor();
     updateAdxl345Sensor();
   }
