@@ -16,9 +16,9 @@ Versi 1.1
 <img width="969" height="470" alt="Screenshot 2026-06-26 235012" src="https://github.com/user-attachments/assets/d0e37db9-2b87-48a8-9f3f-f30f2debf875" />
 
 Versi 1.2
-<img width="1920" height="1200" alt="Screenshot 2026-09-04 171104" src="https://github.com/user-attachments/assets/dd6609b1-0d75-4fc8-a2f7-e99d21403fde" />
-<img width="1910" height="605" alt="Screenshot 2026-09-07 094348" src="https://github.com/user-attachments/assets/bd739d60-36e6-4402-a584-b2a43dd1a1a4" />
-<img width="1911" height="702" alt="Screenshot 2026-09-07 094355" src="https://github.com/user-attachments/assets/5e60a0fd-c513-46ea-94b7-284520e6d546" />
+<img width="1908" height="936" alt="Screenshot 2026-09-07 094334" src="https://github.com/user-attachments/assets/c9359b02-ef90-4ea8-bf06-5079a68a0ea8" />
+<img width="1910" height="605" alt="Screenshot 2026-09-07 094348" src="https://github.com/user-attachments/assets/c51267ed-a939-4564-aba7-47006cadecec" />
+<img width="1911" height="702" alt="Screenshot 2026-09-07 094355" src="https://github.com/user-attachments/assets/f98d6012-5366-4e14-b824-b395defc16a0" />
 
 
 # Rangkaian
