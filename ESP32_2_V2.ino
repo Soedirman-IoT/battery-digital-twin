@@ -419,7 +419,7 @@ void updateLm35Sensor() {
   }
   float rawAvg = (float)rawSum / (float)LM35_SAMPLE_COUNT;
   float voltage = (rawAvg / ADC_MAX_COUNT) * ADC_REF_V;
-  float tempBaru = (voltage * 100.0) + 16;
+  float tempBaru = (voltage * 100.0) + 13.4;
 
   motorDcTempC =
   0.9 * motorDcTempC +
