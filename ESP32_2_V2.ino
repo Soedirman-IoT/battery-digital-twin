@@ -92,25 +92,12 @@ const int I2C_SDA_PIN = 26;
 const int I2C_SCL_PIN = 27;
 
 // ================= I2C / ADXL345 ERROR HANDLING =================
-const uint32_t I2C_CLOCK_HZ = 100000;       // 100 kHz
-const uint16_t I2C_TIMEOUT_MS = 20;         // timeout transaksi I2C
-
+const uint32_t I2C_CLOCK_HZ = 100000;
+const uint16_t I2C_TIMEOUT_MS = 20;
 const uint8_t ADXL345_I2C_ADDR = 0x53;
 const uint8_t ADXL345_DEVID_REG = 0x00;
 const uint8_t ADXL345_EXPECTED_DEVID = 0xE5;
-
-// Batas fisik ADXL345 pada range ±16 g
 const float ADXL345_MAX_VALID_MS2 = 160.0;
-
-// Recovery hanya setelah beberapa error berturut-turut
-const uint8_t ADXL345_MAX_CONSECUTIVE_ERRORS = 5;
-
-// Agar tidak initialize berulang-ulang terlalu cepat
-const unsigned long ADXL345_RECOVERY_INTERVAL_MS = 5000;
-
-uint8_t adxlConsecutiveErrors = 0;
-unsigned long lastAdxlRecoveryMs = 0;
-unsigned long adxlTotalErrors = 0;
 
 // Pastikan address INA219 berbeda via jumper A0/A1.
 const uint8_t INA219_U_ADDR = 0x40;
@@ -473,38 +460,162 @@ void updateLm35Sensor() {
   motorDcTempC = tempBaru;
 }
 
-bool checkAdxl345Device() {
-  Wire.beginTransmission(ADXL345_I2C_ADDR);
-  Wire.write(ADXL345_DEVID_REG);
+// ================= ADXL345 ROBUST RECOVERY =================
+// Recovery dibuat bertahap:
+// 1) cek register/device ID + konfigurasi ADXL345
+// 2) baca data register langsung (bukan hanya getEvent())
+// 3) jika komunikasi/data abnormal berulang -> re-init ADXL345
+// 4) jika re-init gagal -> re-start I2C peripheral
+// 5) TIDAK langsung restart ESP32
 
-  uint8_t error = Wire.endTransmission(false);
+const uint8_t ADXL345_DATA_START_REG = 0x32;
+const uint8_t ADXL345_DATA_LENGTH = 6;
+const uint8_t ADXL345_POWER_CTL_REG = 0x2D;
+const uint8_t ADXL345_DATA_FORMAT_REG = 0x31;
+const uint8_t ADXL345_BW_RATE_REG = 0x2C;
 
-  if (error != 0) {
+const uint8_t ADXL345_EXPECTED_POWER_CTL = 0x08; // Measure mode
+const uint8_t ADXL345_EXPECTED_DATA_FORMAT = 0x0B; // FULL_RES + +/-16g
+const uint8_t ADXL345_EXPECTED_BW_RATE = 0x0A; // 100 Hz
+
+const float ADXL345_G_TO_MS2 = 9.80665;
+const float ADXL345_STATIC_MAG_MIN_MS2 = 7.0;
+const float ADXL345_STATIC_MAG_MAX_MS2 = 12.5;
+
+const uint8_t ADXL345_MAX_BAD_READS = 5;
+const uint8_t ADXL345_MAX_STUCK_READS = 15;
+const unsigned long ADXL345_RECOVERY_INTERVAL_MS = 5000;
+const unsigned long ADXL345_HEALTHCHECK_INTERVAL_MS = 2000;
+
+uint8_t adxlConsecutiveErrors = 0;
+uint8_t adxlConsecutiveStuck = 0;
+unsigned long lastAdxlRecoveryMs = 0;
+unsigned long lastAdxlHealthCheckMs = 0;
+unsigned long adxlTotalErrors = 0;
+unsigned long adxlTotalRecoveries = 0;
+unsigned long adxlSuccessfulRecoveries = 0;
+unsigned long adxlFailedRecoveries = 0;
+
+int16_t adxlLastRawX = 0;
+int16_t adxlLastRawY = 0;
+int16_t adxlLastRawZ = 0;
+bool adxlHasLastRaw = false;
+
+bool i2cReadBytes(uint8_t address, uint8_t reg, uint8_t* buffer, uint8_t length) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  uint8_t txError = Wire.endTransmission(false);
+  if (txError != 0) return false;
+
+  uint8_t received = Wire.requestFrom(address, length, (uint8_t)true);
+  if (received != length) {
+    while (Wire.available()) Wire.read();
     return false;
   }
 
-  uint8_t received = Wire.requestFrom(
-    ADXL345_I2C_ADDR,
-    (uint8_t)1
-  );
-
-  if (received != 1) {
-    return false;
+  for (uint8_t i = 0; i < length; i++) {
+    if (!Wire.available()) return false;
+    buffer[i] = Wire.read();
   }
-
-  uint8_t deviceId = Wire.read();
-
-  return (deviceId == ADXL345_EXPECTED_DEVID);
+  return true;
 }
 
+bool i2cReadRegister(uint8_t address, uint8_t reg, uint8_t& value) {
+  return i2cReadBytes(address, reg, &value, 1);
+}
+
+bool i2cWriteRegister(uint8_t address, uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission(true) == 0;
+}
+
+bool checkAdxl345Device() {
+  uint8_t deviceId = 0;
+  if (!i2cReadRegister(ADXL345_I2C_ADDR, ADXL345_DEVID_REG, deviceId)) {
+    return false;
+  }
+  return deviceId == ADXL345_EXPECTED_DEVID;
+}
+
+bool checkAdxl345Configuration() {
+  uint8_t powerCtl = 0;
+  uint8_t dataFormat = 0;
+  uint8_t bwRate = 0;
+
+  if (!i2cReadRegister(ADXL345_I2C_ADDR, ADXL345_POWER_CTL_REG, powerCtl)) return false;
+  if (!i2cReadRegister(ADXL345_I2C_ADDR, ADXL345_DATA_FORMAT_REG, dataFormat)) return false;
+  if (!i2cReadRegister(ADXL345_I2C_ADDR, ADXL345_BW_RATE_REG, bwRate)) return false;
+
+  bool ok = true;
+
+  if (powerCtl != ADXL345_EXPECTED_POWER_CTL) {
+    Serial.print("[ADXL345] POWER_CTL abnormal: 0x");
+    Serial.println(powerCtl, HEX);
+    ok = false;
+  }
+
+  // Hanya cek bit konfigurasi yang kita perlukan.
+  // 0x0B = FULL_RES + +/-16g, tanpa self-test/interrupt mode tambahan.
+  if ((dataFormat & 0x0F) != ADXL345_EXPECTED_DATA_FORMAT) {
+    Serial.print("[ADXL345] DATA_FORMAT abnormal: 0x");
+    Serial.println(dataFormat, HEX);
+    ok = false;
+  }
+
+  if (bwRate != ADXL345_EXPECTED_BW_RATE) {
+    Serial.print("[ADXL345] BW_RATE abnormal: 0x");
+    Serial.println(bwRate, HEX);
+    ok = false;
+  }
+
+  return ok;
+}
+
+bool readAdxl345Raw(int16_t& x, int16_t& y, int16_t& z) {
+  uint8_t data[ADXL345_DATA_LENGTH];
+
+  if (!i2cReadBytes(ADXL345_I2C_ADDR, ADXL345_DATA_START_REG, data, ADXL345_DATA_LENGTH)) {
+    return false;
+  }
+
+  x = (int16_t)((uint16_t)data[1] << 8 | data[0]);
+  y = (int16_t)((uint16_t)data[3] << 8 | data[2]);
+  z = (int16_t)((uint16_t)data[5] << 8 | data[4]);
+
+  // Pada FULL_RES, data efektif berada dalam sekitar +/- 256 LSB untuk +/-16g.
+  // Beri margin agar transaksi korup yang menghasilkan nilai ekstrem bisa ditolak.
+  if (abs((int)x) > 6000 || abs((int)y) > 6000 || abs((int)z) > 6000) {
+    return false;
+  }
+
+  return true;
+}
+
+bool readAdxl345Data(float& x, float& y, float& z) {
+  int16_t rawX, rawY, rawZ;
+  if (!readAdxl345Raw(rawX, rawY, rawZ)) return false;
+
+  x = ((float)rawX) * ADXL345_G_TO_MS2 / 256.0;
+  y = ((float)rawY) * ADXL345_G_TO_MS2 / 256.0;
+  z = ((float)rawZ) * ADXL345_G_TO_MS2 / 256.0;
+
+  if (!isfinite(x) || !isfinite(y) || !isfinite(z)) return false;
+  if (fabs(x) > ADXL345_MAX_VALID_MS2 ||
+      fabs(y) > ADXL345_MAX_VALID_MS2 ||
+      fabs(z) > ADXL345_MAX_VALID_MS2) return false;
+
+  return true;
+}
 
 bool initializeAdxl345() {
-
   if (!checkAdxl345Device()) {
     Serial.println("[ADXL345] Device ID check FAILED.");
     return false;
   }
 
+  // Library init tetap dipakai agar object Adafruit sinkron dengan sensor.
   if (!adxl.begin()) {
     Serial.println("[ADXL345] Library initialization FAILED.");
     return false;
@@ -512,14 +623,40 @@ bool initializeAdxl345() {
 
   adxl.setRange(ADXL345_RANGE_16_G);
 
-  Serial.println("[ADXL345] Initialized successfully.");
+  // Pastikan sensor berada pada measure mode dan 100 Hz.
+  if (!i2cWriteRegister(ADXL345_I2C_ADDR, ADXL345_POWER_CTL_REG, ADXL345_EXPECTED_POWER_CTL)) {
+    Serial.println("[ADXL345] Failed to set POWER_CTL.");
+    return false;
+  }
 
+  if (!i2cWriteRegister(ADXL345_I2C_ADDR, ADXL345_BW_RATE_REG, ADXL345_EXPECTED_BW_RATE)) {
+    Serial.println("[ADXL345] Failed to set BW_RATE.");
+    return false;
+  }
+
+  if (!i2cWriteRegister(ADXL345_I2C_ADDR, ADXL345_DATA_FORMAT_REG, ADXL345_EXPECTED_DATA_FORMAT)) {
+    Serial.println("[ADXL345] Failed to set DATA_FORMAT.");
+    return false;
+  }
+
+  delay(10);
+
+  if (!checkAdxl345Device() || !checkAdxl345Configuration()) {
+    Serial.println("[ADXL345] Post-init verification FAILED.");
+    return false;
+  }
+
+  int16_t rx, ry, rz;
+  if (!readAdxl345Raw(rx, ry, rz)) {
+    Serial.println("[ADXL345] Post-init data read FAILED.");
+    return false;
+  }
+
+  Serial.println("[ADXL345] Initialized and verified successfully.");
   return true;
 }
 
-
 void setupAdxl345() {
-
   adxlReady = initializeAdxl345();
 
   if (!adxlReady) {
@@ -530,49 +667,97 @@ void setupAdxl345() {
   Serial.println("[ADXL345] Ready.");
 }
 
-void updateAdxl345Sensor() {
+bool restartI2cAndRecoverAdxl() {
+  Serial.println("[I2C] Reinitializing I2C bus...");
 
-  // =====================================================
-  // ADXL345 tidak siap
-  // =====================================================
-  if (!adxlReady) {
+  // Hentikan Wire lalu mulai kembali pada pin yang sama.
+  Wire.end();
+  delay(5);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_CLOCK_HZ);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+  delay(5);
 
-    // Coba recovery secara periodik
-    unsigned long now = millis();
+  return initializeAdxl345();
+}
 
-    if (now - lastAdxlRecoveryMs >= ADXL345_RECOVERY_INTERVAL_MS) {
+void performAdxlRecovery(const char* reason) {
+  unsigned long now = millis();
+  if (now - lastAdxlRecoveryMs < ADXL345_RECOVERY_INTERVAL_MS) return;
 
-      lastAdxlRecoveryMs = now;
+  lastAdxlRecoveryMs = now;
+  adxlTotalRecoveries++;
 
-      Serial.println("[ADXL345] Attempting recovery...");
+  Serial.println();
+  Serial.println("[ADXL345] ===== RECOVERY START =====");
+  Serial.print("[ADXL345] Reason: ");
+  Serial.println(reason);
 
-      if (initializeAdxl345()) {
-
-        adxlReady = true;
-        adxlConsecutiveErrors = 0;
-
-        Serial.println("[ADXL345] Recovery SUCCESS.");
-
-      } else {
-
-        adxlReady = false;
-
-        Serial.println("[ADXL345] Recovery FAILED.");
-      }
-    }
-
+  // Level 1: re-init ADXL345 tanpa menyentuh WiFi/MQTT.
+  if (initializeAdxl345()) {
+    adxlReady = true;
+    adxlConsecutiveErrors = 0;
+    adxlConsecutiveStuck = 0;
+    adxlHasLastRaw = false;
+    adxlSuccessfulRecoveries++;
+    Serial.println("[ADXL345] Recovery by re-initialization SUCCESS.");
+    Serial.println("[ADXL345] ===== RECOVERY END =====");
     return;
   }
 
+  // Level 2: kalau device re-init gagal, reset peripheral I2C.
+  Serial.println("[ADXL345] Re-init failed. Trying I2C peripheral recovery...");
 
-  // =====================================================
-  // Sampling
-  // =====================================================
+  if (restartI2cAndRecoverAdxl()) {
+    adxlReady = true;
+    adxlConsecutiveErrors = 0;
+    adxlConsecutiveStuck = 0;
+    adxlHasLastRaw = false;
+    adxlSuccessfulRecoveries++;
+    Serial.println("[I2C] Bus recovery SUCCESS.");
+    Serial.println("[ADXL345] ===== RECOVERY END =====");
+    return;
+  }
+
+  adxlReady = false;
+  adxlFailedRecoveries++;
+  Serial.println("[ADXL345] Recovery FAILED. ESP32 is NOT restarted automatically.");
+  Serial.println("[ADXL345] ===== RECOVERY END =====");
+}
+
+void updateAdxl345Sensor() {
+  unsigned long now = millis();
+
+  // Kalau ADXL belum siap, coba recovery periodik.
+  if (!adxlReady) {
+    if (now - lastAdxlRecoveryMs >= ADXL345_RECOVERY_INTERVAL_MS) {
+      performAdxlRecovery("ADXL not ready");
+    }
+    return;
+  }
+
+  // Health check periodik: cek Device ID + konfigurasi register.
+  // Ini lebih sensitif terhadap state/configuration abnormal dibanding hanya NaN.
+  if (now - lastAdxlHealthCheckMs >= ADXL345_HEALTHCHECK_INTERVAL_MS) {
+    lastAdxlHealthCheckMs = now;
+
+    if (!checkAdxl345Device() || !checkAdxl345Configuration()) {
+      adxlConsecutiveErrors++;
+      adxlTotalErrors++;
+      Serial.print("[ADXL345] Health check FAILED. Count = ");
+      Serial.println(adxlConsecutiveErrors);
+
+      if (adxlConsecutiveErrors >= ADXL345_MAX_BAD_READS) {
+        performAdxlRecovery("Device/configuration health check failed repeatedly");
+      }
+      return;
+    }
+  }
+
+  // Sampling langsung dari register ADXL345.
   const int sampleCount = 25;
-
   float sumSq = 0.0;
   float peak = 0.0;
-
   int validSamples = 0;
 
   float lastValidX = accelX;
@@ -580,177 +765,108 @@ void updateAdxl345Sensor() {
   float lastValidZ = accelZ;
   float lastValidMagnitude = accelMagnitude;
 
-  sensors_event_t event;
-
+  int16_t rawX, rawY, rawZ;
 
   for (int i = 0; i < sampleCount; i++) {
-
-    // ---------------------------------------------------
-    // Baca ADXL345
-    // ---------------------------------------------------
-    adxl.getEvent(&event);
-
-    float x = event.acceleration.x;
-    float y = event.acceleration.y;
-    float z = event.acceleration.z;
-
-
-    // ---------------------------------------------------
-    // Validasi nilai
-    // ---------------------------------------------------
-
-    bool validData = true;
-
-    // Cek NaN / infinity
-    if (!isfinite(x) ||
-        !isfinite(y) ||
-        !isfinite(z)) {
-
-      validData = false;
-    }
-
-
-    // Cek batas fisik ±16g
-    if (fabs(x) > ADXL345_MAX_VALID_MS2 ||
-        fabs(y) > ADXL345_MAX_VALID_MS2 ||
-        fabs(z) > ADXL345_MAX_VALID_MS2) {
-
-      validData = false;
-    }
-
-
-    // ---------------------------------------------------
-    // Kalau data invalid → jangan dipakai
-    // ---------------------------------------------------
-    if (!validData) {
-
+    if (!readAdxl345Raw(rawX, rawY, rawZ)) {
       adxlTotalErrors++;
-
-      Serial.println(
-        "[ADXL345] INVALID DATA detected!"
-      );
-
       delayMicroseconds(1000);
-
       continue;
     }
 
+    float x = ((float)rawX) * ADXL345_G_TO_MS2 / 256.0;
+    float y = ((float)rawY) * ADXL345_G_TO_MS2 / 256.0;
+    float z = ((float)rawZ) * ADXL345_G_TO_MS2 / 256.0;
 
-    // ---------------------------------------------------
-    // Data valid
-    // ---------------------------------------------------
-    float mag = sqrt(
-      x * x +
-      y * y +
-      z * z
-    );
+    bool validData = isfinite(x) && isfinite(y) && isfinite(z) &&
+                     fabs(x) <= ADXL345_MAX_VALID_MS2 &&
+                     fabs(y) <= ADXL345_MAX_VALID_MS2 &&
+                     fabs(z) <= ADXL345_MAX_VALID_MS2;
 
+    if (!validData) {
+      adxlTotalErrors++;
+      delayMicroseconds(1000);
+      continue;
+    }
+
+    float mag = sqrt(x * x + y * y + z * z);
     float vib = mag - accelMagnitudeBaseline;
 
     sumSq += vib * vib;
-
-    if (fabs(vib) > peak) {
-      peak = fabs(vib);
-    }
+    if (fabs(vib) > peak) peak = fabs(vib);
 
     validSamples++;
-
     lastValidX = x;
     lastValidY = y;
     lastValidZ = z;
     lastValidMagnitude = mag;
 
+    // Deteksi pembacaan yang benar-benar tidak berubah.
+    // Ini hanya indikator tambahan, bukan langsung dianggap rusak.
+    if (adxlHasLastRaw &&
+        rawX == adxlLastRawX &&
+        rawY == adxlLastRawY &&
+        rawZ == adxlLastRawZ) {
+      adxlConsecutiveStuck++;
+    } else {
+      adxlConsecutiveStuck = 0;
+    }
+
+    adxlLastRawX = rawX;
+    adxlLastRawY = rawY;
+    adxlLastRawZ = rawZ;
+    adxlHasLastRaw = true;
 
     delayMicroseconds(1000);
   }
 
-
-  // =====================================================
-  // Tidak ada sample valid
-  // =====================================================
+  // Tidak ada data yang berhasil dibaca.
   if (validSamples == 0) {
-
     adxlConsecutiveErrors++;
 
-    Serial.print(
-      "[ADXL345] No valid sample. Error count = "
-    );
-
+    Serial.print("[ADXL345] No valid sample. Error count = ");
     Serial.println(adxlConsecutiveErrors);
 
-
-    // Recovery setelah error berturut-turut
-    if (adxlConsecutiveErrors >=
-        ADXL345_MAX_CONSECUTIVE_ERRORS) {
-
-      unsigned long now = millis();
-
-      if (now - lastAdxlRecoveryMs >=
-          ADXL345_RECOVERY_INTERVAL_MS) {
-
-        lastAdxlRecoveryMs = now;
-
-        Serial.println(
-          "[ADXL345] Too many errors. Reinitializing..."
-        );
-
-        adxlReady = initializeAdxl345();
-
-        if (adxlReady) {
-
-          adxlConsecutiveErrors = 0;
-
-          Serial.println(
-            "[ADXL345] Reinitialization SUCCESS."
-          );
-
-        } else {
-
-          Serial.println(
-            "[ADXL345] Reinitialization FAILED."
-          );
-        }
-      }
+    if (adxlConsecutiveErrors >= ADXL345_MAX_BAD_READS) {
+      performAdxlRecovery("No valid ADXL345 samples repeatedly");
     }
-
-    // PENTING:
-    // Pertahankan data valid terakhir.
     return;
   }
 
+  // Jika komunikasi berhasil, reset error transaksi.
+  adxlConsecutiveErrors = 0;
 
-  // =====================================================
-  // Minimal satu sample valid
-  // =====================================================
+  // Jangan menjadikan satu nilai aneh sebagai alasan recovery.
+  // Untuk kondisi motor benar-benar OFF/diam, magnitude yang menetap jauh
+  // dari 1g adalah indikator tambahan bahwa pembacaan perlu dicurigai.
+  bool systemExpectedStatic = (!motorActuallyEnabled && fabs(rpmFiltered) < 50.0);
+  if (systemExpectedStatic) {
+    float magNow = lastValidMagnitude;
+    if (magNow < ADXL345_STATIC_MAG_MIN_MS2 || magNow > ADXL345_STATIC_MAG_MAX_MS2) {
+      adxlConsecutiveStuck++;
+      Serial.print("[ADXL345] Static magnitude abnormal: ");
+      Serial.println(magNow, 3);
+
+      if (adxlConsecutiveStuck >= ADXL345_MAX_STUCK_READS) {
+        performAdxlRecovery("Persistent abnormal acceleration while system is static");
+        if (!adxlReady) return;
+      }
+    } else {
+      adxlConsecutiveStuck = 0;
+    }
+  }
 
   accelX = lastValidX;
   accelY = lastValidY;
   accelZ = lastValidZ;
   accelMagnitude = lastValidMagnitude;
 
-
-  // Karena berhasil membaca data valid,
-  // reset counter error berturut-turut.
-  adxlConsecutiveErrors = 0;
-
-
-  // =====================================================
-  // Update baseline
-  // =====================================================
-
+  // Baseline tetap mengikuti magnitude perlahan, seperti desain awal.
   accelMagnitudeBaseline =
     (VIBRATION_BASELINE_ALPHA * accelMagnitude) +
-    ((1.0 - VIBRATION_BASELINE_ALPHA)
-     * accelMagnitudeBaseline);
+    ((1.0 - VIBRATION_BASELINE_ALPHA) * accelMagnitudeBaseline);
 
-
-  // =====================================================
-  // Hitung RMS dan Peak
-  // =====================================================
-
-  vibrationRms =
-    sqrt(sumSq / (float)validSamples);
-
+  vibrationRms = sqrt(sumSq / (float)validSamples);
   vibrationPeak = peak;
 }
 
