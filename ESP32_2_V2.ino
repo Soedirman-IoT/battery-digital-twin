@@ -103,14 +103,18 @@ const float ADXL345_MAX_VALID_MS2 = 160.0;
 const uint8_t INA219_U_ADDR = 0x40;
 const uint8_t INA219_V_ADDR = 0x41;
 const uint8_t INA219_W_ADDR = 0x44;
+// INA219 tambahan untuk mengukur sisi input sebelum relay charge.
+const uint8_t INA219_CHARGE_INPUT_ADDR = 0x45;
 
 Adafruit_INA219 ina219U(INA219_U_ADDR);
 Adafruit_INA219 ina219V(INA219_V_ADDR);
 Adafruit_INA219 ina219W(INA219_W_ADDR);
+Adafruit_INA219 ina219ChargeInput(INA219_CHARGE_INPUT_ADDR);
 
 bool ina219UReady = false;
 bool ina219VReady = false;
 bool ina219WReady = false;
+bool ina219ChargeInputReady = false;
 
 // Tegangan per fasa terhadap referensi/common yang sama.
 // Data ini dipakai untuk menghitung estimasi tegangan antar fasa.
@@ -131,6 +135,12 @@ float phaseTotalPowerAvg = 0.0;
 float phaseUShuntMv = 0.0;
 float phaseVShuntMv = 0.0;
 float phaseWShuntMv = 0.0;
+
+// Data sisi input charger, sebelum relay charge.
+float chargeInputVoltage = 0.0;
+float chargeInputCurrent = 0.0;
+float chargeInputPower = 0.0;
+float chargeInputShuntMv = 0.0;
 
 // Tegangan antar fasa hasil perhitungan selisih.
 // Ini bukan differential measurement langsung, melainkan estimasi nilai rata-rata.
@@ -365,14 +375,17 @@ void setupIna219() {
   ina219UReady = ina219U.begin();
   ina219VReady = ina219V.begin();
   ina219WReady = ina219W.begin();
+  ina219ChargeInputReady = ina219ChargeInput.begin();
 
   if (ina219UReady) ina219U.setCalibration_32V_2A();
   if (ina219VReady) ina219V.setCalibration_32V_2A();
   if (ina219WReady) ina219W.setCalibration_32V_2A();
+  if (ina219ChargeInputReady) ina219ChargeInput.setCalibration_32V_2A();
 
   Serial.print("INA219 U: "); Serial.println(ina219UReady ? "OK" : "NOT FOUND");
   Serial.print("INA219 V: "); Serial.println(ina219VReady ? "OK" : "NOT FOUND");
   Serial.print("INA219 W: "); Serial.println(ina219WReady ? "OK" : "NOT FOUND");
+  Serial.print("INA219 CHARGE INPUT (0x45): "); Serial.println(ina219ChargeInputReady ? "OK" : "NOT FOUND");
 }
 
 float readInaLoadVoltage(Adafruit_INA219& sensor) {
@@ -407,6 +420,16 @@ void updateIna219Sensors() {
     phaseWPowerAvg = phaseWVoltageAvg * phaseWCurrentAvg;
   } else {
     phaseWShuntMv = phaseWVoltageAvg = phaseWCurrentAvg = phaseWPowerAvg = 0.0;
+  }
+
+  // INA219 0x45: ukur tegangan dan arus sisi input sebelum relay charge.
+  if (ina219ChargeInputReady) {
+    chargeInputShuntMv = ina219ChargeInput.getShuntVoltage_mV();
+    chargeInputVoltage = ina219ChargeInput.getBusVoltage_V() + (chargeInputShuntMv / 1000.0);
+    chargeInputCurrent = ina219ChargeInput.getCurrent_mA() / 1000.0;
+    chargeInputPower = chargeInputVoltage * chargeInputCurrent;
+  } else {
+    chargeInputShuntMv = chargeInputVoltage = chargeInputCurrent = chargeInputPower = 0.0;
   }
 
   // Bagian yang diminta dosen:
@@ -1105,6 +1128,7 @@ void publishMotorData() {
       "\"ina219_u_ready\":%s,"
       "\"ina219_v_ready\":%s,"
       "\"ina219_w_ready\":%s,"
+      "\"ina219_charge_input_ready\":%s,"
       "\"phase_u_voltage_avg\":%.3f,"
       "\"phase_v_voltage_avg\":%.3f,"
       "\"phase_w_voltage_avg\":%.3f,"
@@ -1118,6 +1142,10 @@ void publishMotorData() {
       "\"phase_u_shunt_mv\":%.3f,"
       "\"phase_v_shunt_mv\":%.3f,"
       "\"phase_w_shunt_mv\":%.3f,"
+      "\"charge_input_voltage\":%.3f,"
+      "\"charge_input_current\":%.3f,"
+      "\"charge_input_power\":%.3f,"
+      "\"charge_input_shunt_mv\":%.3f,"
       "\"vuv_voltage_avg\":%.3f,"
       "\"vuw_voltage_avg\":%.3f,"
       "\"vvw_voltage_avg\":%.3f,"
@@ -1151,6 +1179,7 @@ void publishMotorData() {
     ina219UReady ? "true" : "false",
     ina219VReady ? "true" : "false",
     ina219WReady ? "true" : "false",
+    ina219ChargeInputReady ? "true" : "false",
     phaseUVoltageAvg,
     phaseVVoltageAvg,
     phaseWVoltageAvg,
@@ -1164,6 +1193,10 @@ void publishMotorData() {
     phaseUShuntMv,
     phaseVShuntMv,
     phaseWShuntMv,
+    chargeInputVoltage,
+    chargeInputCurrent,
+    chargeInputPower,
+    chargeInputShuntMv,
     vuvVoltageAvg,
     vuwVoltageAvg,
     vvwVoltageAvg,
@@ -1197,6 +1230,9 @@ void publishMotorData() {
       "\"voltage_u\":%.3f,"
       "\"voltage_v\":%.3f,"
       "\"voltage_w\":%.3f,"
+      "\"charge_input_voltage\":%.3f,"
+      "\"charge_input_current\":%.3f,"
+      "\"charge_input_power\":%.3f,"
       "\"vibration_x\":%.3f,"
       "\"vibration_y\":%.3f,"
       "\"vibration_z\":%.3f"
@@ -1245,6 +1281,11 @@ void printMotorData() {
   Serial.print("Vuv/Vuw/Vvw           : "); Serial.print(vuvVoltageAvg, 3); Serial.print(" / "); Serial.print(vuwVoltageAvg, 3); Serial.print(" / "); Serial.println(vvwVoltageAvg, 3);
   Serial.print("Ptotal avg            : "); Serial.print(phaseTotalPowerAvg, 3); Serial.println(" W");
 
+  Serial.println("--- INA219 charge input (0x45) ---");
+  Serial.print("Charge input V        : "); Serial.print(chargeInputVoltage, 3); Serial.println(" V");
+  Serial.print("Charge input I        : "); Serial.print(chargeInputCurrent, 3); Serial.println(" A");
+  Serial.print("Charge input P        : "); Serial.print(chargeInputPower, 3); Serial.println(" W");
+
   Serial.print("Motor DC Temp LM35    : "); Serial.print(motorDcTempC, 2); Serial.println(" C");
   Serial.print("Vibration RMS         : "); Serial.print(vibrationRms, 4); Serial.println(" m/s^2");
   Serial.print("Slip/Load Anomaly     : "); Serial.println(isSlipOrLoadAnomaly() ? "YES" : "NO");
@@ -1289,7 +1330,7 @@ void setup() {
 
   x9cResetToZero();
 
-  Serial.println("ESP2 MOTOR CONTROLLER - DST-WLTC + X9C103S + 3xINA219 + LM35 + ADXL345 + MQTT");
+  Serial.println("ESP2 MOTOR CONTROLLER - DST-WLTC + X9C103S + 4xINA219 + LM35 + ADXL345 + MQTT");
 
   wifiClient.setInsecure();
   setupWiFi();
