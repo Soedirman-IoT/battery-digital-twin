@@ -29,3 +29,7 @@ Versi 1.2
 
 # Rangkaian 1.3
 <img width="1595" height="1173" alt="WhatsApp Image 2026-09-05 at 14 13 38" src="https://github.com/user-attachments/assets/b1f2b687-7da7-4548-8fc5-d28d733ceeac" />
+
+# Rangkaian 1.4
+<img width="3148" height="2308" alt="IMG_20260909_140922 jpg" src="https://github.com/user-attachments/assets/e1162eba-fb14-4589-9762-ac3a5a3944dd" />
+
