@@ -72,21 +72,6 @@ bool nightChargeMode = false;
 const int SCHEDULE_START_HOUR = 1;
 const int SCHEDULE_STOP_HOUR  = 23;
 
-// ================= ROAD LOAD PROFILE CONFIG =================
-// 01:00 - 23:00 = motor ON 
-// 23:00 - 01:00 = motor OFF (istirahat/charge-only)
-//
-// Profil DST-WLTC untuk pengaturan speed BLDC dijalankan oleh ESP2.
-// ESP1 hanya mengirim izin motor_enable dan load_stage ke ESP2 melalui MQTT.
-const int FLAT_START_HOUR = 1;
-const int REST_START_HOUR = 23;
-
-enum RoadProfile {
-  ROAD_REST,
-  ROAD_FLAT,
-};
-RoadProfile roadProfile = ROAD_REST;
-
 enum LoadStage {
   LOAD_REST,
   LOAD_FULL_SPEED,
@@ -121,24 +106,6 @@ const char* roadProfileToString() {
   }
 }
 
-void updateRoadProfileFromCalendar() {
-  struct tm timeinfo;
-
-  if (!getLocalTime(&timeinfo, 100)) {
-    currentHourWIB = -1;
-    roadProfile = ROAD_REST;
-    return;
-  }
-
-  currentHourWIB = timeinfo.tm_hour;
-
-  if (currentHourWIB >= FLAT_START_HOUR && currentHourWIB) {
-    roadProfile = ROAD_FLAT;
-  } 
-  else {
-    roadProfile = ROAD_REST;
-  }
-}
 
 void updateScheduleState() {
   struct tm timeinfo;
@@ -154,7 +121,6 @@ void updateScheduleState() {
 
 void updateSystemAllowed() {
   updateScheduleState();
-  updateRoadProfileFromCalendar();
 
   if (controlMode == CONTROL_AUTO) {
     // Siang: beban/motor boleh jalan, charge juga boleh jalan jika baterai drop.
@@ -977,7 +943,6 @@ void updateRelayOutput() {
   // ESP1 memegang kendali penuh semua relay.
   // Relay resistor hanya boleh ON pada tahap 2 / CLIMB ketika sistem benar-benar sedang LOAD.
   // Pada CHARGE, SAFE_OFF, TRANSITION, malam/istirahat, atau data waktu invalid, resistor dipaksa OFF.
-  updateRoadProfileFromCalendar();
 
   resistorRelayOn =
     loadRelayOn &&
