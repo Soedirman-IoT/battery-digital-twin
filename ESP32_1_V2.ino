@@ -106,8 +106,8 @@ void updateScheduleState() {
     return;
   }
 
-  int hour = timeinfo.tm_hour;
-  scheduleActive = (hour >= SCHEDULE_START_HOUR && hour < SCHEDULE_STOP_HOUR);
+  currentHourWIB = timeinfo.tm_hour;
+  scheduleActive = (currentHourWIB >= SCHEDULE_START_HOUR && currentHourWIB < SCHEDULE_STOP_HOUR);
 }
 
 void updateSystemAllowed() {
