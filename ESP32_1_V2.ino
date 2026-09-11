@@ -73,20 +73,17 @@ const int SCHEDULE_START_HOUR = 1;
 const int SCHEDULE_STOP_HOUR  = 23;
 
 // ================= ROAD LOAD PROFILE CONFIG =================
-// 01:00 - 12:00 = tahap 1: motor DC tanpa beban resistor -> RELAY_LOAD ON, RELAY_RESISTOR OFF
-// 12:00 - 23:00 = tahap 2: motor DC dengan beban resistor -> RELAY_LOAD ON, RELAY_RESISTOR ON
-// 23:00 - 01:00 = istirahat/charge-only -> RELAY_LOAD OFF, RELAY_RESISTOR OFF
+// 01:00 - 23:00 = motor ON 
+// 23:00 - 01:00 = motor OFF (istirahat/charge-only)
 //
 // Profil DST-WLTC untuk pengaturan speed BLDC dijalankan oleh ESP2.
 // ESP1 hanya mengirim izin motor_enable dan load_stage ke ESP2 melalui MQTT.
 const int FLAT_START_HOUR = 1;
-const int CLIMB_START_HOUR = 12;
 const int REST_START_HOUR = 23;
 
 enum RoadProfile {
   ROAD_REST,
   ROAD_FLAT,
-  ROAD_CLIMB
 };
 RoadProfile roadProfile = ROAD_REST;
 
@@ -119,7 +116,6 @@ const char* controlModeToString() {
 const char* roadProfileToString() {
   switch (roadProfile) {
     case ROAD_FLAT: return "FLAT";
-    case ROAD_CLIMB: return "CLIMB";
     case ROAD_REST: return "REST";
     default: return "UNKNOWN";
   }
@@ -136,11 +132,10 @@ void updateRoadProfileFromCalendar() {
 
   currentHourWIB = timeinfo.tm_hour;
 
-  if (currentHourWIB >= FLAT_START_HOUR && currentHourWIB < CLIMB_START_HOUR) {
+  if (currentHourWIB >= FLAT_START_HOUR && currentHourWIB) {
     roadProfile = ROAD_FLAT;
-  } else if (currentHourWIB >= CLIMB_START_HOUR && currentHourWIB < REST_START_HOUR) {
-    roadProfile = ROAD_CLIMB;
-  } else {
+  } 
+  else {
     roadProfile = ROAD_REST;
   }
 }
