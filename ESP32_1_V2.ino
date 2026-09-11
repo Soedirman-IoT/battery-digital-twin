@@ -98,15 +98,6 @@ const char* controlModeToString() {
   }
 }
 
-const char* roadProfileToString() {
-  switch (roadProfile) {
-    case ROAD_FLAT: return "FLAT";
-    case ROAD_REST: return "REST";
-    default: return "UNKNOWN";
-  }
-}
-
-
 void updateScheduleState() {
   struct tm timeinfo;
 
@@ -752,7 +743,6 @@ void publishMQTTData() {
       "\"relay_resistor\":%s,"
       "\"motor_enable\":%s,"
       "\"esp2_load_stage\":\"%s\","
-      "\"road_profile\":\"%s\","
       "\"current_hour_wib\":%d,"
       "\"control_mode\":\"%s\","
       "\"manual_power\":%s,"
@@ -799,7 +789,6 @@ void publishMQTTData() {
     resistorRelayOn ? "true" : "false",
     isMotorEnableForESP2() ? "true" : "false",
     getESP2LoadStage(),
-    roadProfileToString(),
     currentHourWIB,
     controlModeToString(),
     manualPower ? "true" : "false",
@@ -897,7 +886,6 @@ void publishESP2Command() {
       "\"timestamp_ms\":%lu,"
       "\"motor_enable\":%s,"
       "\"load_stage\":\"%s\","
-      "\"road_profile\":\"%s\","
       "\"system_mode\":\"%s\","
       "\"battery_safe\":%s,"
       "\"bms_timeout\":%s,"
@@ -913,7 +901,6 @@ void publishESP2Command() {
     now,
     isMotorEnableForESP2() ? "true" : "false",
     getESP2LoadStage(),
-    roadProfileToString(),
     systemModeToString(),
     isBatteryDataSafeForMotor() ? "true" : "false",
     isBMSTimeout() ? "true" : "false",
@@ -1509,9 +1496,6 @@ void printDataForControl() {
 
   Serial.print("Stage untuk ESP2       : ");
   Serial.println(getESP2LoadStage());
-
-  Serial.print("Profil Jalan           : ");
-  Serial.println(roadProfileToString());
 
   Serial.print("Jam WIB                : ");
   if (currentHourWIB >= 0) Serial.println(currentHourWIB);
