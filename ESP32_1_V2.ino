@@ -163,6 +163,7 @@ int minCellIndex = -1;
 int maxCellIndex = -1;
 
 float batteryCurrent = 0.0;
+float batteryPower = 0.0;
 float balanceCurrent = 0.0;
 
 float batteryT1 = 0.0;
@@ -733,6 +734,7 @@ void publishMQTTData() {
       "\"min_cell_index\":%d,"
       "\"max_cell_index\":%d,"
       "\"battery_current\":%.3f,"
+      "\"battery_power\":%.3f,"
       "\"balance_current\":%.3f,"
       "\"battery_t1\":%.1f,"
       "\"battery_t2\":%.1f,"
@@ -779,6 +781,7 @@ void publishMQTTData() {
     minCellIndex + 1,
     maxCellIndex + 1,
     batteryCurrent,
+    batteryPower,
     balanceCurrent,
     batteryT1,
     batteryT2,
@@ -840,6 +843,7 @@ void publishBatteryMeasurementStream() {
       "\"cell_5\":%.3f,"
       "\"cell_6\":%.3f,"
       "\"battery_current\":%.3f,"
+      "\"battery_power\":%.3f,"
       "\"temperature_1\":%.2f,"
       "\"temperature_2\":%.2f"
     "}",
@@ -856,6 +860,7 @@ void publishBatteryMeasurementStream() {
     cellVoltage[4],
     cellVoltage[5],
     batteryCurrent,
+    batteryPower,
     batteryT1,
     batteryT2
   );
@@ -1040,8 +1045,16 @@ void updateFromFullJKFrame(const uint8_t* data, size_t len) {
 
   float current = readInt32LE(data, 126 + JK_RUNTIME_OFFSET) * 0.001f;
   currentValid = isReasonableCurrent(current);
-  if (currentValid) {
-    batteryCurrent = current;
+
+    if (currentValid) {
+      batteryCurrent = current;
+
+    // Hitung daya baterai: P = V x I
+    if (voltageValid) {
+      batteryPower = packVoltage * batteryCurrent;
+    }   else {
+      batteryPower = 0.0;
+    }
   }
 
   float balCurrent = ((int16_t)((uint16_t)data[138 + JK_RUNTIME_OFFSET] | ((uint16_t)data[139 + JK_RUNTIME_OFFSET] << 8))) * 0.001f;
