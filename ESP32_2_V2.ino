@@ -148,6 +148,25 @@ float vuvVoltageAvg = 0.0;
 float vuwVoltageAvg = 0.0;
 float vvwVoltageAvg = 0.0;
 
+// =====================================================
+// INA219 RECOVERY
+// =====================================================
+
+#define INA219_MAX_CONSECUTIVE_ERRORS 3
+
+uint8_t ina219UErrorCount = 0;
+uint8_t ina219VErrorCount = 0;
+uint8_t ina219WErrorCount = 0;
+
+bool ina219URecovering = false;
+bool ina219VRecovering = false;
+bool ina219WRecovering = false;
+
+uint32_t ina219URecoveryCount = 0;
+uint32_t ina219VRecoveryCount = 0;
+uint32_t ina219WRecoveryCount = 0;
+
+
 String motorCondition = "NORMAL";
 // ambang perbedaan arus (A)
 const float CURRENT_FAULT_THRESHOLD = 0.5;
@@ -369,6 +388,353 @@ void updateWltcControl() {
   targetPotStep = mapRpmToPotStep(rpmSetpoint);
   x9cSetStep(targetPotStep);
 }
+
+bool resetINA219Register(uint8_t address) {
+
+  // Configuration register = 0x00
+  // Reset bit = bit 15
+  Wire.beginTransmission(address);
+  Wire.write(0x00);
+  Wire.write(0x80);
+  Wire.write(0x00);
+
+  uint8_t error = Wire.endTransmission();
+
+  if (error != 0) {
+    Serial.printf(
+      "[INA219 0x%02X] Reset register FAILED, I2C error=%d\n",
+      address,
+      error
+    );
+    return false;
+  }
+
+  delay(5);
+
+  Serial.printf(
+    "[INA219 0x%02X] Software reset SUCCESS\n",
+    address
+  );
+
+  return true;
+}
+
+bool recoverINA219(
+  Adafruit_INA219 &sensor,
+  uint8_t address,
+  const char *name
+) {
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.printf("[INA219 %s] RECOVERY START\n", name);
+  Serial.println("======================================");
+
+  // -------------------------------------------------
+  // STEP 1 - Reset INA219 register
+  // -------------------------------------------------
+
+  bool resetOK = resetINA219Register(address);
+
+  if (!resetOK) {
+    Serial.printf(
+      "[INA219 %s] Software reset failed\n",
+      name
+    );
+  }
+
+  // -------------------------------------------------
+  // STEP 2 - Re-initialize sensor
+  // -------------------------------------------------
+
+  delay(10);
+
+  bool beginOK = sensor.begin();
+
+  if (!beginOK) {
+
+    Serial.printf(
+      "[INA219 %s] begin() FAILED\n",
+      name
+    );
+
+    return false;
+  }
+
+  Serial.printf(
+    "[INA219 %s] begin() SUCCESS\n",
+    name
+  );
+
+  // -------------------------------------------------
+  // STEP 3 - Restore calibration
+  // -------------------------------------------------
+
+  sensor.setCalibration_32V_2A();
+
+  delay(10);
+
+  Serial.printf(
+    "[INA219 %s] Calibration restored\n",
+    name
+  );
+
+  // -------------------------------------------------
+  // STEP 4 - Test communication
+  // -------------------------------------------------
+
+  float testVoltage = sensor.getBusVoltage_V();
+  float testCurrent = sensor.getCurrent_mA();
+
+  Serial.printf(
+    "[INA219 %s] Test reading: V=%.3f V, I=%.3f mA\n",
+    name,
+    testVoltage,
+    testCurrent
+  );
+
+  // -------------------------------------------------
+  // STEP 5 - Check hasil pembacaan
+  // -------------------------------------------------
+
+  if (isnan(testVoltage) || isnan(testCurrent)) {
+
+    Serial.printf(
+      "[INA219 %s] TEST FAILED - NaN detected\n",
+      name
+    );
+
+    return false;
+  }
+
+  Serial.printf(
+    "[INA219 %s] RECOVERY SUCCESS\n",
+    name
+  );
+
+  return true;
+}
+
+void recoverINA219U() {
+
+  if (ina219URecovering) return;
+
+  ina219URecovering = true;
+  ina219URecoveryCount++;
+
+  bool success = recoverINA219(
+    ina219U,
+    0x40,
+    "U"
+  );
+
+  if (success) {
+
+    ina219UErrorCount = 0;
+
+    Serial.println(
+      "[INA219 U] Recovery completed successfully"
+    );
+
+  } else {
+
+    Serial.println(
+      "[INA219 U] Recovery FAILED"
+    );
+  }
+
+  ina219URecovering = false;
+}
+
+void recoverINA219V() {
+
+  if (ina219VRecovering) return;
+
+  ina219VRecovering = true;
+  ina219VRecoveryCount++;
+
+  bool success = recoverINA219(
+    ina219V,
+    0x41,
+    "V"
+  );
+
+  if (success) {
+
+    ina219VErrorCount = 0;
+
+    Serial.println(
+      "[INA219 V] Recovery completed successfully"
+    );
+
+  } else {
+
+    Serial.println(
+      "[INA219 V] Recovery FAILED"
+    );
+  }
+
+  ina219VRecovering = false;
+}
+
+void recoverINA219W() {
+
+  if (ina219WRecovering) return;
+
+  ina219WRecovering = true;
+  ina219WRecoveryCount++;
+
+  bool success = recoverINA219(
+    ina219W,
+    0x44,
+    "W"
+  );
+
+  if (success) {
+
+    ina219WErrorCount = 0;
+
+    Serial.println(
+      "[INA219 W] Recovery completed successfully"
+    );
+
+  } else {
+
+    Serial.println(
+      "[INA219 W] Recovery FAILED"
+    );
+  }
+
+  ina219WRecovering = false;
+}
+
+bool isMotorExpectedStopped() {
+
+  return (
+    !motorActuallyEnabled &&
+    fabs(rpmFiltered) < 50.0
+  );
+}
+
+void checkINA219UAbnormal() {
+
+  if (!isMotorExpectedStopped()) {
+    ina219UErrorCount = 0;
+    return;
+  }
+
+  const float VOLTAGE_LIMIT = 1.0;  // V
+  const float CURRENT_LIMIT = 0.2;  // A
+
+  bool abnormal =
+    fabs(phaseUVoltageAvg) > VOLTAGE_LIMIT ||
+    fabs(phaseUCurrentAvg) > CURRENT_LIMIT;
+
+  if (abnormal) {
+
+    ina219UErrorCount++;
+
+    Serial.printf(
+      "[INA219 U] Abnormal reading #%d: V=%.3f V, I=%.3f A\n",
+      ina219UErrorCount,
+      phaseUVoltageAvg,
+      phaseUCurrentAvg
+    );
+
+    if (
+      ina219UErrorCount >=
+      INA219_MAX_CONSECUTIVE_ERRORS
+    ) {
+
+      recoverINA219U();
+    }
+
+  } else {
+
+    // Normal → reset consecutive error counter
+    ina219UErrorCount = 0;
+  }
+}
+
+void checkINA219VAbnormal() {
+
+  if (!isMotorExpectedStopped()) {
+    ina219VErrorCount = 0;
+    return;
+  }
+
+  const float VOLTAGE_LIMIT = 1.0;
+  const float CURRENT_LIMIT = 0.2;
+
+  bool abnormal =
+    fabs(phaseVVoltageAvg) > VOLTAGE_LIMIT ||
+    fabs(phaseVCurrentAvg) > CURRENT_LIMIT;
+
+  if (abnormal) {
+
+    ina219VErrorCount++;
+
+    Serial.printf(
+      "[INA219 V] Abnormal reading #%d: V=%.3f V, I=%.3f A\n",
+      ina219VErrorCount,
+      phaseVVoltageAvg,
+      phaseVCurrentAvg
+    );
+
+    if (
+      ina219VErrorCount >=
+      INA219_MAX_CONSECUTIVE_ERRORS
+    ) {
+
+      recoverINA219V();
+    }
+
+  } else {
+
+    ina219VErrorCount = 0;
+  }
+}
+
+void checkINA219WAbnormal() {
+
+  if (!isMotorExpectedStopped()) {
+    ina219WErrorCount = 0;
+    return;
+  }
+
+  const float VOLTAGE_LIMIT = 1.0;
+  const float CURRENT_LIMIT = 0.2;
+
+  bool abnormal =
+    fabs(phaseWVoltageAvg) > VOLTAGE_LIMIT ||
+    fabs(phaseWCurrentAvg) > CURRENT_LIMIT;
+
+  if (abnormal) {
+
+    ina219WErrorCount++;
+
+    Serial.printf(
+      "[INA219 W] Abnormal reading #%d: V=%.3f V, I=%.3f A\n",
+      ina219WErrorCount,
+      phaseWVoltageAvg,
+      phaseWCurrentAvg
+    );
+
+    if (
+      ina219WErrorCount >=
+      INA219_MAX_CONSECUTIVE_ERRORS
+    ) {
+
+      recoverINA219W();
+    }
+
+  } else {
+
+    ina219WErrorCount = 0;
+  }
+}
+
+
 
 // ================= SENSOR READING =================
 void setupIna219() {
@@ -1351,6 +1717,10 @@ void loop() {
     updateMotorCondition();
     updateLm35Sensor();
     updateAdxl345Sensor();
+    updateIna219Sensors();
+    checkINA219UAbnormal();
+    checkINA219VAbnormal();
+    checkINA219WAbnormal();
   }
 
   if (now - lastControl >= 1000) {
