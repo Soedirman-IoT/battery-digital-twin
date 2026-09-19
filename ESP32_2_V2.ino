@@ -611,7 +611,6 @@ void recoverINA219W() {
 bool isMotorExpectedStopped() {
 
   return (
-    !motorActuallyEnabled &&
     fabs(rpmFiltered) < 50.0
   );
 }
