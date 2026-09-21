@@ -29,7 +29,6 @@ const char* MQTT_TOPIC_CONTROL = "skripsi/bms01/control";
 
 // Topic streaming untuk Digital Twin.
 // Dibuat sama seperti ESP2 agar data motor dan baterai dapat masuk
-const char* MQTT_TOPIC_BATTERY_STREAM = "battery_stream";
 
 volatile uint32_t bleDisconnectCount = 0;
 volatile uint32_t bleReconnectCount = 0;
@@ -815,65 +814,7 @@ void publishMQTTData() {
   Serial.println(ok ? "OK" : "FAILED");
 }
 
-// ================= DIGITAL TWIN BATTERY STREAM =================
-// Publish data inti baterai ke topic measurement_stream.
-// Polanya dibuat mengikuti ESP2: data lengkap tetap dikirim ke
-// MQTT_TOPIC_DATA, sedangkan measurement_stream hanya berisi
-// variabel yang diperlukan oleh Digital Twin.
-void publishBatteryMeasurementStream() {
-  if (!mqttClient.connected()) return;
 
-  unsigned long now = millis();
-  if (now - lastMeasurementStreamPublish < MQTT_PUBLISH_INTERVAL_MS) return;
-  lastMeasurementStreamPublish = now;
-
-  char measurementPayload[700];
-
-  snprintf(
-    measurementPayload,
-    sizeof(measurementPayload),
-    "{"
-      "\"timestamp\":%lu,"
-      "\"battery_condition\":\"%s\","
-      "\"pack_voltage\":%.3f,"
-      "\"cell_1\":%.3f,"
-      "\"cell_2\":%.3f,"
-      "\"cell_3\":%.3f,"
-      "\"cell_4\":%.3f,"
-      "\"cell_5\":%.3f,"
-      "\"cell_6\":%.3f,"
-      "\"battery_current\":%.3f,"
-      "\"battery_power\":%.3f,"
-      "\"temperature_1\":%.2f,"
-      "\"temperature_2\":%.2f"
-    "}",
-    now,
-    isBMSTimeout() ? "BMS_TIMEOUT" :
-      (!voltageValid || !currentValid || !tempValid) ? "DATA_INVALID" :
-      (chargeRelayOn ? "CHARGING" :
-       loadRelayOn ? "DISCHARGING" : "IDLE"),
-    packVoltage,
-    cellVoltage[0],
-    cellVoltage[1],
-    cellVoltage[2],
-    cellVoltage[3],
-    cellVoltage[4],
-    cellVoltage[5],
-    batteryCurrent,
-    batteryPower,
-    batteryT1,
-    batteryT2
-  );
-
-  bool ok = mqttClient.publish(
-    MQTT_TOPIC_BATTERY_STREAM,
-    measurementPayload,
-    false
-  );
-
-  Serial.print("MQTT BATTERY MEASUREMENT_STREAM publish: ");
-  Serial.println(ok ? "OK" : "FAILED");
-}
 
 void publishESP2Command() {
   if (!mqttClient.connected()) return;
@@ -1874,7 +1815,6 @@ void loop() {
     }
 
     publishMQTTData();
-    publishBatteryMeasurementStream();
     publishESP2Command();
 
   } else {
