@@ -38,7 +38,6 @@ const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
 const char* MQTT_TOPIC_MOTOR_CMD    = "skripsi/motor01/cmd";
 const char* MQTT_TOPIC_MOTOR_DATA   = "skripsi/motor01/data";
 const char* MQTT_TOPIC_MOTOR_STATUS = "skripsi/motor01/status";
-const char* MQTT_TOPIC_MEASUREMENT_STREAM = "measurement_stream";
 
 unsigned long wifiDisconnectedSince = 0;
 const unsigned long WIFI_RESTART_TIMEOUT_MS = 120000; // 2 menit
@@ -1474,26 +1473,11 @@ void publishMotorData() {
     sizeof(payload),
     "{"
       "\"timestamp_ms\":%lu,"
-      "\"motor_cmd_timeout\":%s,"
-      "\"motor_enable_from_esp1\":%s,"
-      "\"battery_safe_from_esp1\":%s,"
-      "\"motor_actually_enabled\":%s,"
-      "\"load_stage\":\"%s\","
-      "\"esp1_system_mode\":\"%s\","
       "\"wltc_second\":%lu,"
       "\"wltc_speed_kmh\":%.2f,"
       "\"rpm_setpoint\":%.1f,"
-      "\"pot_step\":%d,"
       "\"rpm_measured\":%.1f,"
       "\"rpm_filtered\":%.1f,"
-      "\"encoder_count\":%ld,"
-      "\"encoder_count_in_one_rev\":%ld,"
-      "\"position_degree\":%.2f,"
-      "\"total_revolution\":%.4f,"
-      "\"ina219_u_ready\":%s,"
-      "\"ina219_v_ready\":%s,"
-      "\"ina219_w_ready\":%s,"
-      "\"ina219_charge_input_ready\":%s,"
       "\"phase_u_voltage_avg\":%.3f,"
       "\"phase_v_voltage_avg\":%.3f,"
       "\"phase_w_voltage_avg\":%.3f,"
@@ -1522,29 +1506,14 @@ void publishMotorData() {
       "\"accel_magnitude\":%.3f,"
       "\"vibration_rms\":%.4f,"
       "\"vibration_peak\":%.4f,"
-      "\"slip_or_load_anomaly\":%s"
+      "\"motor_condition\":\"%s\""
     "}",
     now,
-    cmdTimeout ? "true" : "false",
-    motorEnableFromEsp1 ? "true" : "false",
-    batterySafeFromEsp1 ? "true" : "false",
-    motorActuallyEnabled ? "true" : "false",
-    loadStage.c_str(),
-    esp1SystemMode.c_str(),
     wltcSecond,
     wltcSpeedKmh,
     rpmSetpoint,
-    currentPotStep,
     rpmMeasured,
     rpmFiltered,
-    encoderCountNow,
-    encoderCountInOneRev,
-    positionDegree,
-    totalRevolution,
-    ina219UReady ? "true" : "false",
-    ina219VReady ? "true" : "false",
-    ina219WReady ? "true" : "false",
-    ina219ChargeInputReady ? "true" : "false",
     phaseUVoltageAvg,
     phaseVVoltageAvg,
     phaseWVoltageAvg,
@@ -1573,50 +1542,13 @@ void publishMotorData() {
     accelMagnitude,
     vibrationRms,
     vibrationPeak,
-    isSlipOrLoadAnomaly() ? "true" : "false"
+    motorCondition.c_str()
   );
 
   bool ok = mqttClient.publish(MQTT_TOPIC_MOTOR_DATA, payload, false);
   Serial.print("MQTT motor publish: ");
   Serial.println(ok ? "OK" : "FAILED");
 
-  char measurementPayload[512];
-  snprintf(
-    measurementPayload,
-    sizeof(measurementPayload),
-    "{"
-      "\"timestamp\":%lu,"
-      "\"motor_condition\":\"%s\","
-      "\"speed\":%.1f,"
-      "\"temperature\":%.2f,"
-      "\"current_u\":%.3f,"
-      "\"current_v\":%.3f,"
-      "\"current_w\":%.3f,"
-      "\"voltage_u\":%.3f,"
-      "\"voltage_v\":%.3f,"
-      "\"voltage_w\":%.3f,"
-      "\"vibration_x\":%.3f,"
-      "\"vibration_y\":%.3f,"
-      "\"vibration_z\":%.3f"
-    "}",
-    millis(),
-    motorCondition.c_str(),
-    rpmFiltered,
-    motorDcTempC,
-    phaseUCurrentAvg,
-    phaseVCurrentAvg,
-    phaseWCurrentAvg,
-    phaseUVoltageAvg,
-    phaseVVoltageAvg,
-    phaseWVoltageAvg,
-    accelX,
-    accelY,
-    accelZ
-  );
-
-  bool ok2 = mqttClient.publish(MQTT_TOPIC_MEASUREMENT_STREAM, measurementPayload, false);
-  Serial.print("MQTT MEASUREMENT_STREAM publish: ");
-  Serial.println(ok ? "OK" : "FAILED");
 }
 
 void printMotorData() {
