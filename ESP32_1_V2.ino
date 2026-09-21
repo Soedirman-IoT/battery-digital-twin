@@ -714,7 +714,6 @@ void publishMQTTData() {
     sizeof(payload),
     "{"
       "\"timestamp_ms\":%lu,"
-      "\"bms_timeout\":%s,"
       "\"voltage_valid\":%s,"
       "\"current_valid\":%s,"
       "\"temp_valid\":%s,"
@@ -738,30 +737,19 @@ void publishMQTTData() {
       "\"battery_t1\":%.1f,"
       "\"battery_t2\":%.1f,"
       "\"mos_temp\":%.1f,"
-      "\"system_mode\":\"%s\","
-      "\"relay_load\":%s,"
-      "\"relay_charge\":%s,"
-      "\"relay_resistor\":%s,"
-      "\"motor_enable\":%s,"
       "\"esp2_load_stage\":\"%s\","
       "\"current_hour_wib\":%d,"
       "\"control_mode\":\"%s\","
       "\"manual_power\":%s,"
       "\"schedule_active\":%s,"
       "\"system_allowed\":%s,"
-      "\"load_allowed\":%s,"
-      "\"charge_allowed\":%s,"
       "\"night_charge_mode\":%s,"
       "\"battery_low_raw\":%s,"
-      "\"battery_low_confirmed\":%s,"
       "\"battery_full_raw\":%s,"
-      "\"battery_full_confirmed\":%s,"
-      "\"charge_lock_active\":%s,"
       "\"charge_min_timer_active\":%s,"
       "\"charge_min_remaining_sec\":%lu"
     "}",
     now,
-    isBMSTimeout() ? "true" : "false",
     voltageValid ? "true" : "false",
     currentValid ? "true" : "false",
     tempValid ? "true" : "false",
@@ -785,25 +773,15 @@ void publishMQTTData() {
     batteryT1,
     batteryT2,
     mosTemp,
-    systemModeToString(),
-    loadRelayOn ? "true" : "false",
-    chargeRelayOn ? "true" : "false",
-    resistorRelayOn ? "true" : "false",
-    isMotorEnableForESP2() ? "true" : "false",
     getESP2LoadStage(),
     currentHourWIB,
     controlModeToString(),
     manualPower ? "true" : "false",
     scheduleActive ? "true" : "false",
     systemAllowed ? "true" : "false",
-    loadAllowed ? "true" : "false",
-    chargeAllowed ? "true" : "false",
     nightChargeMode ? "true" : "false",
     batteryLowRaw ? "true" : "false",
-    batteryLowConfirmed ? "true" : "false",
     batteryFullRaw ? "true" : "false",
-    batteryFullConfirmed ? "true" : "false",
-    chargeLockActive ? "true" : "false",
     chargeMinTimerActive ? "true" : "false",
     getRemainingMinChargeSeconds()
   );
