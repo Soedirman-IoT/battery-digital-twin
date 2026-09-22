@@ -866,8 +866,8 @@ const uint8_t ADXL345_EXPECTED_DATA_FORMAT = 0x0B; // FULL_RES + +/-16g
 const uint8_t ADXL345_EXPECTED_BW_RATE = 0x0A; // 100 Hz
 
 const float ADXL345_G_TO_MS2 = 9.80665;
-const float ADXL345_STATIC_MAG_MIN_MS2 = 7.0;
-const float ADXL345_STATIC_MAG_MAX_MS2 = 12.5;
+const float ADXL345_STATIC_MAG_MIN_MS2 = 9;
+const float ADXL345_STATIC_MAG_MAX_MS2 = 9.8;
 
 const uint8_t ADXL345_MAX_BAD_READS = 5;
 const uint8_t ADXL345_MAX_STUCK_READS = 15;
