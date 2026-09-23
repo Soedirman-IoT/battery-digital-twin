@@ -7,6 +7,7 @@
 #include <Adafruit_INA219.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
+#include <time.h>
 
 // =====================================================
 // ESP2 - MOTOR + DST-WLTC CONTROLLER
@@ -45,6 +46,15 @@ const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MOTOR_CMD_TIMEOUT_MS = 10000;
+
+// ================= NTP / ABSOLUTE TIMESTAMP CONFIG =================
+// timestamp_ms tetap menggunakan millis() untuk waktu relatif sejak boot.
+// timestamp_unix_ms digunakan untuk pengukuran latency karena berbasis Unix epoch.
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
+const long NTP_GMT_OFFSET_SEC = 0;      // Unix timestamp menggunakan UTC
+const int NTP_DAYLIGHT_OFFSET_SEC = 0;
+bool ntpTimeSynced = false;
 
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -1398,6 +1408,61 @@ bool isSlipOrLoadAnomaly() {
   return fabs(rpmFiltered) < (0.35 * rpmSetpoint);
 }
 
+// ================= ABSOLUTE TIMESTAMP / NTP =================
+
+bool syncNtpTime() {
+  if (WiFi.status() != WL_CONNECTED) {
+    ntpTimeSynced = false;
+    return false;
+  }
+
+  Serial.println("[NTP] Synchronizing time...");
+
+  configTime(
+    NTP_GMT_OFFSET_SEC,
+    NTP_DAYLIGHT_OFFSET_SEC,
+    NTP_SERVER_1,
+    NTP_SERVER_2
+  );
+
+  struct tm timeinfo;
+  const unsigned long startWait = millis();
+
+  while (!getLocalTime(&timeinfo, 1000)) {
+    if (millis() - startWait >= 15000) {
+      ntpTimeSynced = false;
+      Serial.println("[NTP] Synchronization FAILED.");
+      return false;
+    }
+    Serial.println("[NTP] Waiting for time synchronization...");
+  }
+
+  ntpTimeSynced = true;
+
+  Serial.print("[NTP] Synchronized UTC: ");
+  Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+
+  return true;
+}
+
+// Unix timestamp dalam milliseconds.
+// Mengembalikan 0 jika waktu belum tersinkronisasi.
+long long getUnixTimestampMs() {
+  struct timeval tv;
+
+  if (!ntpTimeSynced || gettimeofday(&tv, nullptr) != 0) {
+    return 0;
+  }
+
+  // Hindari mengirim waktu 1970 jika NTP belum siap.
+  if (tv.tv_sec < 1577836800) { // 2020-01-01 00:00:00 UTC
+    return 0;
+  }
+
+  return ((long long)tv.tv_sec * 1000LL) +
+         ((long long)tv.tv_usec / 1000LL);
+}
+
 // ================= WIFI + MQTT =================
 void setupWiFi() {
   Serial.println();
@@ -1425,6 +1490,9 @@ void setupWiFi() {
     Serial.println();
     Serial.print("WiFi connected. IP: ");
     Serial.println(WiFi.localIP());
+
+    // Sinkronisasi waktu dilakukan setelah WiFi tersambung.
+    syncNtpTime();
   } else {
     Serial.println();
     Serial.println("WiFi not connected. Motor remains safe until MQTT command is received.");
@@ -1566,6 +1634,7 @@ void publishMotorData() {
     sizeof(payload),
     "{"
       "\"timestamp_ms\":%lu,"
+      "\"timestamp_unix_ms\":%lld,"
       "\"wltc_second\":%lu,"
       "\"wltc_speed_kmh\":%.2f,"
       "\"rpm_setpoint\":%.1f,"
@@ -1602,6 +1671,7 @@ void publishMotorData() {
       "\"motor_condition\":\"%s\""
     "}",
     now,
+    getUnixTimestampMs(),
     wltcSecond,
     wltcSpeedKmh,
     rpmSetpoint,
