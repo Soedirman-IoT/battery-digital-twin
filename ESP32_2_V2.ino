@@ -28,12 +28,12 @@ const char* WIFI_SSID = "eduroam";
 #define EAP_USERNAME "dimas.anhar@mhs.unsoed.ac.id"
 #define EAP_PASSWORD "Raihananhar##23076"
 
-const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
+const char* MQTT_HOST = "eb43ae842b964f298d6fb1af0d77c485.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
 
 const char* MQTT_CLIENT_ID = "esp32-motor-01";
-const char* MQTT_USERNAME = "hivemq.webclient.1780374811805";
-const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
+const char* MQTT_USERNAME = "DigitalTwin_ESP32";
+const char* MQTT_PASSWORD = "unsoedtop10";
 
 const char* MQTT_TOPIC_MOTOR_CMD    = "skripsi/motor01/cmd";
 const char* MQTT_TOPIC_MOTOR_DATA   = "skripsi/motor01/data";
@@ -148,7 +148,7 @@ float vuwVoltageAvg = 0.0;
 float vvwVoltageAvg = 0.0;
 
 // =====================================================
-// INA219 RECOVERY
+// INA219 U/V/W RECOVERY
 // =====================================================
 
 #define INA219_MAX_CONSECUTIVE_ERRORS 3
@@ -164,6 +164,13 @@ bool ina219WRecovering = false;
 uint32_t ina219URecoveryCount = 0;
 uint32_t ina219VRecoveryCount = 0;
 uint32_t ina219WRecoveryCount = 0;
+
+// INA219 CHARGE INPUT recovery
+// Hanya divalidasi saat ESP1 mengirim system_mode = CHARGE.
+const float INA219_CHARGE_MIN_CURRENT_A = 0.2; // 200 mA
+uint8_t ina219ChargeErrorCount = 0;
+bool ina219ChargeRecovering = false;
+uint32_t ina219ChargeRecoveryCount = 0;
 
 
 String motorCondition = "NORMAL";
@@ -607,6 +614,39 @@ void recoverINA219W() {
   ina219WRecovering = false;
 }
 
+// Recovery INA219 CHARGE INPUT menggunakan mekanisme yang sama
+// dengan INA219 U/V/W: reset -> begin() -> calibration -> test reading.
+void recoverINA219ChargeInput() {
+
+  if (ina219ChargeRecovering) return;
+
+  ina219ChargeRecovering = true;
+  ina219ChargeRecoveryCount++;
+
+  bool success = recoverINA219(
+    ina219ChargeInput,
+    INA219_CHARGE_INPUT_ADDR,
+    "CHARGE INPUT"
+  );
+
+  if (success) {
+
+    ina219ChargeErrorCount = 0;
+
+    Serial.println(
+      "[INA219 CHARGE] Recovery completed successfully"
+    );
+
+  } else {
+
+    Serial.println(
+      "[INA219 CHARGE] Recovery FAILED"
+    );
+  }
+
+  ina219ChargeRecovering = false;
+}
+
 bool isMotorExpectedStopped() {
 
   return (
@@ -729,6 +769,59 @@ void checkINA219WAbnormal() {
   } else {
 
     ina219WErrorCount = 0;
+  }
+}
+
+void checkINA219ChargeAbnormal() {
+
+  // INA219 charge hanya diperiksa ketika sistem memang berada
+  // pada mode CHARGE berdasarkan command dari ESP1.
+  if (esp1SystemMode != "CHARGE") {
+    ina219ChargeErrorCount = 0;
+    return;
+  }
+
+  // Jika sensor belum terdeteksi saat setup, jangan jalankan
+  // watchdog recovery berbasis pembacaan arus.
+  if (!ina219ChargeInputReady) {
+    ina219ChargeErrorCount = 0;
+    return;
+  }
+
+  float chargeCurrent = fabs(chargeInputCurrent);
+
+  // Saat CHARGE, arus sekitar 200-270 mA adalah kondisi normal
+  // pada sistem ini. Nilai <= 5 mA dianggap pembacaan abnormal.
+  bool abnormal = chargeCurrent <= INA219_CHARGE_MIN_CURRENT_A;
+
+  if (abnormal) {
+
+    ina219ChargeErrorCount++;
+
+    Serial.printf(
+      "[INA219 CHARGE] Abnormal reading #%d: V=%.3f V, I=%.3f mA, Mode=%s\n",
+      ina219ChargeErrorCount,
+      chargeInputVoltage,
+      chargeInputCurrent * 1000.0,
+      esp1SystemMode.c_str()
+    );
+
+    if (
+      ina219ChargeErrorCount >=
+      INA219_MAX_CONSECUTIVE_ERRORS
+    ) {
+
+      Serial.println(
+        "[INA219 CHARGE] Persistent low current detected -> recovery"
+      );
+
+      recoverINA219ChargeInput();
+    }
+
+  } else {
+
+    // Arus kembali normal -> reset consecutive error counter.
+    ina219ChargeErrorCount = 0;
   }
 }
 
@@ -1648,10 +1741,10 @@ void loop() {
     updateMotorCondition();
     updateLm35Sensor();
     updateAdxl345Sensor();
-    updateIna219Sensors();
     checkINA219UAbnormal();
     checkINA219VAbnormal();
     checkINA219WAbnormal();
+    checkINA219ChargeAbnormal();
   }
 
   if (now - lastControl >= 1000) {
