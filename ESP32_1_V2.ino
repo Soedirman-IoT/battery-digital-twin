@@ -16,12 +16,12 @@ const char* WIFI_SSID = "eduroam";
 #define EAP_USERNAME "dimas.anhar@mhs.unsoed.ac.id"
 #define EAP_PASSWORD "Raihananhar##23076"
 
-const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
+const char* MQTT_HOST = "eb43ae842b964f298d6fb1af0d77c485.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
 
 const char* MQTT_CLIENT_ID = "esp32-bms-01";
-const char* MQTT_USERNAME = "hivemq.webclient.1780374811805";
-const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
+const char* MQTT_USERNAME = "DigitalTwin_ESP32";
+const char* MQTT_PASSWORD = "unsoedtop10";
 
 const char* MQTT_TOPIC_DATA   = "skripsi/bms01/data";
 const char* MQTT_TOPIC_STATUS = "skripsi/bms01/status";
@@ -88,6 +88,23 @@ const float DUMMY_TO_WLTC  = 42.0;
 
 const long GMT_OFFSET_SEC = 7 * 3600;
 const int DAYLIGHT_OFFSET_SEC = 0;
+
+// ================= NTP / UNIX TIMESTAMP =================
+// Returns Unix time in milliseconds. Returns 0 if NTP time has not
+// been synchronized yet, so an invalid 1970 timestamp is not used.
+long long getUnixTimestampMs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+
+  // Reject timestamps before 2025-01-01 as an indication that NTP
+  // synchronization has not completed.
+  if (tv.tv_sec < 1735689600LL) {
+    return 0;
+  }
+
+  return ((long long)tv.tv_sec * 1000LL) + (tv.tv_usec / 1000LL);
+}
+
 
 const char* controlModeToString() {
   switch (controlMode) {
@@ -707,13 +724,18 @@ void publishMQTTData() {
   if (now - lastMqttPublish < MQTT_PUBLISH_INTERVAL_MS) return;
   lastMqttPublish = now;
 
-  char payload[1400];
+  // Timestamp based on synchronized NTP/Unix time.
+  // timestamp_ms remains millis() for backward compatibility.
+  long long timestampUnixMs = getUnixTimestampMs();
+
+  char payload[1500];
 
   snprintf(
     payload,
     sizeof(payload),
     "{"
       "\"timestamp_ms\":%lu,"
+      "\"timestamp_unix_ms\":%lld,"
       "\"voltage_valid\":%s,"
       "\"current_valid\":%s,"
       "\"temp_valid\":%s,"
@@ -750,6 +772,7 @@ void publishMQTTData() {
       "\"charge_min_remaining_sec\":%lu"
     "}",
     now,
+    timestampUnixMs,
     voltageValid ? "true" : "false",
     currentValid ? "true" : "false",
     tempValid ? "true" : "false",
@@ -801,7 +824,10 @@ void publishESP2Command() {
   if (now - lastMotorCommandPublish < MQTT_PUBLISH_INTERVAL_MS) return;
   lastMotorCommandPublish = now;
 
-  char payload[700];
+  // Timestamp based on synchronized NTP/Unix time.
+  long long timestampUnixMs = getUnixTimestampMs();
+
+  char payload[800];
 
   snprintf(
     payload,
