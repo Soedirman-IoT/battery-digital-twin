@@ -67,7 +67,7 @@ unsigned long lastMotorCmdTime = 0;
 // ================= DIGITAL POTENTIOMETER X9C103S CONFIG =================
 const int X9C_CS_PIN  = 18;
 const int X9C_INC_PIN = 19;
-const int X9C_UD_PIN  = 21;
+const int X9C_UD_PIN  = 5;
 const bool POT_STEP_HIGHER_MEANS_HIGHER_SPEED = false;
 const int POT_MIN_STEP = 0;
 const int POT_MAX_STEP = 99;
@@ -97,8 +97,8 @@ float positionDegree = 0.0;
 float totalRevolution = 0.0;
 
 // ================= SENSOR CONFIG =================
-const int I2C_SDA_PIN = 26;
-const int I2C_SCL_PIN = 27;
+const int I2C_SDA_PIN = 21;
+const int I2C_SCL_PIN = 22;
 
 // ================= I2C / ADXL345 ERROR HANDLING =================
 const uint32_t I2C_CLOCK_HZ = 100000;
