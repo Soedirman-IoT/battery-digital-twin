@@ -1,4 +1,4 @@
-# battery-digital-twin
+# EV-System-digital-twin
 
 isian kode buat project penelitian digital battery twin
 
