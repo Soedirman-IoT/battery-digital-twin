@@ -21,10 +21,7 @@ Versi 1.2
 <img width="1911" height="702" alt="Screenshot 2026-09-07 094355" src="https://github.com/user-attachments/assets/f98d6012-5366-4e14-b824-b395defc16a0" />
 
 Versi 1.3
-<img width="1918" height="944" alt="Screenshot 2026-09-26 234746" src="https://github.com/user-attachments/assets/cc18e161-99dc-49ea-a6d3-836ffe473b82" />
-<img width="1898" height="766" alt="Screenshot 2026-09-26 235213" src="https://github.com/user-attachments/assets/dbdc0ea6-456f-4092-9e2a-7529784c0b4d" />
-<img width="1919" height="609" alt="Screenshot 2026-09-26 235241" src="https://github.com/user-attachments/assets/ff784b92-51fe-4a4e-8bb0-e0e252b852fa" />
-
+<img width="1908" height="2306" alt="Dashboard Monitoring Baterai-1790504841327" src="https://github.com/user-attachments/assets/1709b8b7-ef0e-4659-9e07-502b251d71c3" />
 
 # Rangkaian
 <img width="1032" height="1829" alt="IMG20260607140405" src="https://github.com/user-attachments/assets/312c5a97-4060-4eab-9e88-ac81b203ca5c" />
