@@ -8,6 +8,9 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
 #include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 // =====================================================
 // ESP2 - MOTOR + DST-WLTC CONTROLLER
@@ -237,6 +240,18 @@ bool motorActuallyEnabled = false;
 float wltcSpeedKmh = 0.0;
 float rpmSetpoint = 0.0;
 unsigned long wltcSecond = 0;
+
+// ================= FREERTOS TASK ARCHITECTURE =================
+// Task 1: Network  -> WiFi, MQTT, reconnect, publish
+// Task 2: Control  -> RPM, sensors, WLTC, X9C103S, relay/motor control
+// loop() sengaja dibuat ringan agar tidak menjadi tempat eksekusi utama.
+
+TaskHandle_t networkTaskHandle = nullptr;
+TaskHandle_t controlTaskHandle = nullptr;
+SemaphoreHandle_t dataMutex = nullptr;
+
+void networkTask(void *parameter);
+void controlTask(void *parameter);
 
 // ================= HELPER =================
 float clampFloat(float x, float lo, float hi) {
@@ -1564,6 +1579,10 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   String command = String(msg);
   command.trim();
 
+  // Callback berjalan pada Network Task. Lindungi state yang dibaca
+  // oleh Control Task agar tidak terjadi race condition.
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+
   motorEnableFromEsp1 = extractJsonBool(command, "motor_enable", motorEnableFromEsp1);
   batterySafeFromEsp1 = extractJsonBool(command, "battery_safe", batterySafeFromEsp1);
   loadStage = extractJsonString(command, "load_stage", loadStage);
@@ -1577,6 +1596,9 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   lastMotorCmdTime = millis();
+
+  if (dataMutex) xSemaphoreGive(dataMutex);
+
   Serial.println("MQTT CMD from ESP1:");
   Serial.println(command);
 }
@@ -1625,6 +1647,8 @@ void publishMotorData() {
   unsigned long now = millis();
   if (now - lastMqttPublish < MQTT_PUBLISH_INTERVAL_MS) return;
   lastMqttPublish = now;
+
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
 
   bool cmdTimeout = (lastMotorCmdTime == 0) || (now - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS);
 
@@ -1708,6 +1732,8 @@ void publishMotorData() {
     motorCondition.c_str()
   );
 
+  if (dataMutex) xSemaphoreGive(dataMutex);
+
   bool ok = mqttClient.publish(MQTT_TOPIC_MOTOR_DATA, payload, false);
   Serial.print("MQTT motor publish: ");
   Serial.println(ok ? "OK" : "FAILED");
@@ -1749,6 +1775,83 @@ void printMotorData() {
   Serial.println("=================================");
 }
 
+// ================= FREERTOS TASKS =================
+
+void networkTask(void *parameter) {
+  (void)parameter;
+
+  for (;;) {
+    // Semua pekerjaan jaringan dipisahkan dari kontrol motor/sensor.
+    maintainWiFi();
+    maintainMQTT();
+    publishMotorData();
+
+    // 10 ms memberi kesempatan task lain dan WiFi stack untuk berjalan.
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void controlTask(void *parameter) {
+  (void)parameter;
+
+  unsigned long lastSensor = 0;
+  unsigned long lastControl = 0;
+  unsigned long lastPrint = 0;
+
+  for (;;) {
+    unsigned long now = millis();
+
+    // =================================================
+    // SENSOR TASK - period 200 ms
+    // Semua sensor dan recovery tetap berada di Control Task.
+    // =================================================
+    if (now - lastSensor >= 200) {
+      lastSensor = now;
+
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+      updateRpm();
+      updateIna219Sensors();
+      updateMotorCondition();
+      updateLm35Sensor();
+      updateAdxl345Sensor();
+      checkINA219UAbnormal();
+      checkINA219VAbnormal();
+      checkINA219WAbnormal();
+      checkINA219ChargeAbnormal();
+
+      if (dataMutex) xSemaphoreGive(dataMutex);
+    }
+
+    // =================================================
+    // MOTOR CONTROL - period 1 s
+    // WLTC + X9C103S + motor enable tetap lokal.
+    // Network loss tidak langsung menghentikan task kontrol.
+    // =================================================
+    if (now - lastControl >= 1000) {
+      lastControl = now;
+
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+      updateWltcControl();
+      if (dataMutex) xSemaphoreGive(dataMutex);
+    }
+
+    // =================================================
+    // SERIAL MONITOR - period 5 s
+    // =================================================
+    if (now - lastPrint >= 5000) {
+      lastPrint = now;
+
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+      printMotorData();
+      if (dataMutex) xSemaphoreGive(dataMutex);
+    }
+
+    // Jangan busy-loop.
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
 // ================= SETUP + LOOP =================
 void setup() {
   Serial.begin(115200);
@@ -1780,7 +1883,7 @@ void setup() {
 
   setupIna219();
   setupAdxl345();
-  
+
   ESP32Encoder::useInternalWeakPullResistors = puType::none;
   encoder.attachFullQuad(ENCODER_A_PIN, ENCODER_B_PIN);
   resetEncoderPosition();
@@ -1792,40 +1895,46 @@ void setup() {
   wifiClient.setInsecure();
   setupWiFi();
   setupMQTT();
+
+  // Mutex dibuat setelah seluruh object sensor selesai diinisialisasi,
+  // sebelum kedua FreeRTOS task mulai mengakses shared state.
+  dataMutex = xSemaphoreCreateMutex();
+
+  if (dataMutex == nullptr) {
+    Serial.println("ERROR: gagal membuat dataMutex. ESP32 akan restart.");
+    delay(1000);
+    ESP.restart();
+  }
+
+  // Task 1: jaringan.
+  xTaskCreate(
+    networkTask,
+    "Network_Task",
+    8192,
+    nullptr,
+    2,
+    &networkTaskHandle
+  );
+
+  // Task 2: sensor + kontrol motor.
+  xTaskCreate(
+    controlTask,
+    "Control_Task",
+    12288,
+    nullptr,
+    2,
+    &controlTaskHandle
+  );
+
+  Serial.println("========================================");
+  Serial.println("FreeRTOS 2-task architecture started");
+  Serial.println("Task 1 : Network_Task");
+  Serial.println("Task 2 : Control_Task");
+  Serial.println("========================================");
 }
 
 void loop() {
-  static unsigned long lastControl = 0;
-  static unsigned long lastSensor = 0;
-  static unsigned long lastPrint = 0;
-
-  maintainWiFi();
-  maintainMQTT();
-
-  unsigned long now = millis();
-
-  if (now - lastSensor >= 200) {
-    lastSensor = now;
-    updateRpm();
-    updateIna219Sensors();
-    updateMotorCondition();
-    updateLm35Sensor();
-    updateAdxl345Sensor();
-    checkINA219UAbnormal();
-    checkINA219VAbnormal();
-    checkINA219WAbnormal();
-    checkINA219ChargeAbnormal();
-  }
-
-  if (now - lastControl >= 1000) {
-    lastControl = now;
-    updateWltcControl();
-  }
-
-  publishMotorData();
-
-  if (now - lastPrint >= 5000) {
-    lastPrint = now;
-    printMotorData();
-  }
+  // Tidak ada pekerjaan utama di loop Arduino.
+  // Seluruh pekerjaan diproses oleh dua FreeRTOS task.
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
