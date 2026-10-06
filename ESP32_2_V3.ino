@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ESP32Encoder.h>
 #include <Wire.h>
@@ -21,16 +22,21 @@
 // =====================================================
 
 // ================= WIFI HOTSPOT + LOCAL MOSQUITTO CONFIG =================
-// ESP2 terhubung ke hotspot PC/laptop yang menjalankan Mosquitto.
+// ESP32 terhubung ke hotspot PC yang juga menjalankan Mosquitto.
 const char* WIFI_SSID = "Digtwin";
 const char* WIFI_PASSWORD = "skripsikelar";
 
-// Isi dengan IPv4 PC yang menjalankan Mosquitto pada jaringan hotspot.
-// Contoh umum Windows Mobile Hotspot: 192.168.137.1
+// Isi dengan IPv4 PC pada adapter hotspot, misalnya 192.168.137.1.
 const char* MQTT_HOST = "10.120.12.45";
 const uint16_t MQTT_PORT = 1883;
 
 const char* MQTT_CLIENT_ID = "esp32-motor-01";
+
+// Mosquitto lokal diasumsikan tanpa authentication.
+// Jika broker memakai username/password, isi kedua nilai ini dan
+// gunakan connect() dengan credential pada maintainMQTT().
+const char* MQTT_USERNAME = nullptr;
+const char* MQTT_PASSWORD = nullptr;
 
 const char* MQTT_TOPIC_MOTOR_CMD    = "skripsi/motor01/cmd";
 const char* MQTT_TOPIC_MOTOR_DATA   = "skripsi/motor01/data";
@@ -63,18 +69,7 @@ unsigned long lastWifiReconnectAttempt = 0;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastMqttPublish = 0;
 unsigned long lastMotorCmdTime = 0;
-volatile bool mqttWasConnected = false;
-volatile bool wifiConnectedFlag = false;
-
-// Shared command data between MQTT task and Arduino loop.
-SemaphoreHandle_t commandMutex = nullptr;
-volatile bool resetPositionRequest = false;
-
-// ================= NETWORK + MQTT FREE RTOS TASK =================
-// Seluruh maintenance WiFi dan akses mqttClient dijalankan dari task ini.
-// Loop utama hanya menangani sensor dan kontrol motor.
-TaskHandle_t networkMqttTaskHandle = nullptr;
-const uint32_t NETWORK_MQTT_TASK_INTERVAL_MS = 10;
+bool mqttWasConnected = false;
 
 // ================= DIGITAL POTENTIOMETER X9C103S CONFIG =================
 const int X9C_CS_PIN  = 18;
@@ -376,35 +371,13 @@ int mapRpmToPotStep(float rpm) {
 }
 
 void updateWltcControl() {
-  bool cmdMotorEnable;
-  bool cmdBatterySafe;
-  String cmdLoadStage;
-  String cmdSystemMode;
-  unsigned long cmdTime;
-
-  if (commandMutex != nullptr) {
-    xSemaphoreTake(commandMutex, portMAX_DELAY);
-    cmdMotorEnable = motorEnableFromEsp1;
-    cmdBatterySafe = batterySafeFromEsp1;
-    cmdLoadStage = loadStage;
-    cmdSystemMode = esp1SystemMode;
-    cmdTime = lastMotorCmdTime;
-    xSemaphoreGive(commandMutex);
-  } else {
-    cmdMotorEnable = motorEnableFromEsp1;
-    cmdBatterySafe = batterySafeFromEsp1;
-    cmdLoadStage = loadStage;
-    cmdSystemMode = esp1SystemMode;
-    cmdTime = lastMotorCmdTime;
-  }
-
-  bool cmdTimeout = (cmdTime == 0) || (millis() - cmdTime > MOTOR_CMD_TIMEOUT_MS);
+  bool cmdTimeout = (lastMotorCmdTime == 0) || (millis() - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS);
   bool allowedByEsp1 =
     !cmdTimeout &&
-    cmdMotorEnable &&
-    cmdBatterySafe &&
-    cmdLoadStage != "REST" &&
-    cmdSystemMode == "LOAD";
+    motorEnableFromEsp1 &&
+    batterySafeFromEsp1 &&
+    loadStage != "REST" &&
+    esp1SystemMode == "LOAD";
 
   if (!allowedByEsp1) {
     wltcSpeedKmh = 0.0;
@@ -417,12 +390,12 @@ void updateWltcControl() {
 
   setMotorEnablePin(true);
 
-  if (cmdLoadStage == "FULL_SPEED"){
+  if (loadStage == "FULL_SPEED"){
     // Motor selalu berputar maksimum
     wltcSpeedKmh = WLTC_MAX_SPEED_KMH;   // hanya untuk tampilan Grafana
     rpmSetpoint = MOTOR_MAX_RPM;
   }
-  else if (cmdLoadStage == "WLTC" || cmdLoadStage == "WLTC_DUMMY"){
+  else if (loadStage == "WLTC" || loadStage == "WLTC_DUMMY"){
     // Jalankan profil WLTC seperti biasa
     wltcSecond = (millis() / 1000UL) % WLTC_CYCLE_SECONDS;
 
@@ -820,16 +793,7 @@ void checkINA219ChargeAbnormal() {
 
   // INA219 charge hanya diperiksa ketika sistem memang berada
   // pada mode CHARGE berdasarkan command dari ESP1.
-  String cmdSystemMode;
-  if (commandMutex != nullptr) {
-    xSemaphoreTake(commandMutex, portMAX_DELAY);
-    cmdSystemMode = esp1SystemMode;
-    xSemaphoreGive(commandMutex);
-  } else {
-    cmdSystemMode = esp1SystemMode;
-  }
-
-  if (cmdSystemMode != "CHARGE") {
+  if (esp1SystemMode != "CHARGE") {
     ina219ChargeErrorCount = 0;
     return;
   }
@@ -856,7 +820,7 @@ void checkINA219ChargeAbnormal() {
       ina219ChargeErrorCount,
       chargeInputVoltage,
       chargeInputCurrent * 1000.0,
-      cmdSystemMode.c_str()
+      esp1SystemMode.c_str()
     );
 
     if (
@@ -1525,12 +1489,13 @@ long long getUnixTimestampMs() {
 // ================= WIFI + MQTT =================
 void setupWiFi() {
   Serial.println();
-  Serial.println("Connecting to PC WiFi Hotspot...");
+  Serial.println("Connecting to WiFi hotspot...");
 
   WiFi.disconnect(true);
-  delay(500);
+  delay(1000);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print("Connecting WiFi");
@@ -1541,19 +1506,13 @@ void setupWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectedFlag = true;
     Serial.println();
-    Serial.print("WiFi connected. ESP32 IP: ");
+    Serial.print("WiFi connected. IP: ");
     Serial.println(WiFi.localIP());
-    Serial.print("MQTT broker: ");
-    Serial.print(MQTT_HOST);
-    Serial.print(":");
-    Serial.println(MQTT_PORT);
 
     // Sinkronisasi waktu dilakukan setelah WiFi tersambung.
     syncNtpTime();
   } else {
-    wifiConnectedFlag = false;
     Serial.println();
     Serial.println("WiFi not connected. Motor remains safe until MQTT command is received.");
   }
@@ -1564,12 +1523,9 @@ void maintainWiFi() {
   // Jika WiFi sudah tersambung
   if (WiFi.status() == WL_CONNECTED) {
 
-    wifiConnectedFlag = true;
     wifiDisconnectedSince = 0;
     return;
   }
-
-  wifiConnectedFlag = false;
 
   // Catat kapan mulai disconnect
   if (wifiDisconnectedSince == 0) {
@@ -1591,6 +1547,8 @@ void maintainWiFi() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+
+    // Reconnect ke hotspot biasa.
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 
@@ -1620,28 +1578,19 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   String command = String(msg);
   command.trim();
 
-  bool requestReset = extractJsonBool(command, "reset_position", false);
+  motorEnableFromEsp1 = extractJsonBool(command, "motor_enable", motorEnableFromEsp1);
+  batterySafeFromEsp1 = extractJsonBool(command, "battery_safe", batterySafeFromEsp1);
+  loadStage = extractJsonString(command, "load_stage", loadStage);
+  esp1SystemMode = extractJsonString(command, "system_mode", esp1SystemMode);
+  loadStage.toUpperCase();
+  esp1SystemMode.toUpperCase();
 
-  // Callback berjalan di MQTT task. Update data command secara atomik
-  // terhadap Arduino loop agar String tidak dibaca ketika sedang ditulis.
-  if (commandMutex != nullptr) {
-    xSemaphoreTake(commandMutex, portMAX_DELAY);
-
-    motorEnableFromEsp1 = extractJsonBool(command, "motor_enable", motorEnableFromEsp1);
-    batterySafeFromEsp1 = extractJsonBool(command, "battery_safe", batterySafeFromEsp1);
-    loadStage = extractJsonString(command, "load_stage", loadStage);
-    esp1SystemMode = extractJsonString(command, "system_mode", esp1SystemMode);
-    loadStage.toUpperCase();
-    esp1SystemMode.toUpperCase();
-
-    if (requestReset) {
-      resetPositionRequest = true;
-    }
-
-    lastMotorCmdTime = millis();
-
-    xSemaphoreGive(commandMutex);
+  if (extractJsonBool(command, "reset_position", false)) {
+    resetEncoderPosition();
+    Serial.println("Encoder position reset to 0 degree.");
   }
+
+  lastMotorCmdTime = millis();
   Serial.println("MQTT CMD from ESP1:");
   Serial.println(command);
 }
@@ -1680,7 +1629,7 @@ void maintainMQTT() {
   lastMqttReconnectAttempt = now;
 
   Serial.print("[MQTT] Reconnecting... ");
-  // Mosquitto lokal dikonfigurasi tanpa username/password.
+  // Mosquitto lokal tanpa authentication.
   bool connected = mqttClient.connect(
     MQTT_CLIENT_ID,
     MQTT_TOPIC_MOTOR_STATUS,
@@ -1730,6 +1679,7 @@ void publishMotorData() {
       "\"phase_u_power_avg\":%.3f,"
       "\"phase_v_power_avg\":%.3f,"
       "\"phase_w_power_avg\":%.3f,"
+      "\"phase_total_power_avg\":%.3f,"
       "\"charge_input_voltage\":%.3f,"
       "\"charge_input_current\":%.3f,"
       "\"charge_input_power\":%.3f,"
@@ -1760,6 +1710,7 @@ void publishMotorData() {
     phaseUPowerAvg,
     phaseVPowerAvg,
     phaseWPowerAvg,
+    phaseTotalPowerAvg,
     chargeInputVoltage,
     chargeInputCurrent,
     chargeInputPower,
@@ -1781,53 +1732,16 @@ void publishMotorData() {
 
 }
 
-// ================= NETWORK + MQTT TASK =================
-void networkMqttTask(void *parameter) {
-  (void)parameter;
-
-  for (;;) {
-    // WiFi dipelihara terlebih dahulu.
-    // Setelah WiFi tersedia, MQTT dilayani dan data dipublish.
-    maintainWiFi();
-    maintainMQTT();
-    publishMotorData();
-
-    vTaskDelay(pdMS_TO_TICKS(NETWORK_MQTT_TASK_INTERVAL_MS));
-  }
-}
-
 void printMotorData() {
-  bool cmdMotorEnable;
-  bool cmdBatterySafe;
-  String cmdLoadStage;
-  String cmdSystemMode;
-  unsigned long cmdTime;
-
-  if (commandMutex != nullptr) {
-    xSemaphoreTake(commandMutex, portMAX_DELAY);
-    cmdMotorEnable = motorEnableFromEsp1;
-    cmdBatterySafe = batterySafeFromEsp1;
-    cmdLoadStage = loadStage;
-    cmdSystemMode = esp1SystemMode;
-    cmdTime = lastMotorCmdTime;
-    xSemaphoreGive(commandMutex);
-  } else {
-    cmdMotorEnable = motorEnableFromEsp1;
-    cmdBatterySafe = batterySafeFromEsp1;
-    cmdLoadStage = loadStage;
-    cmdSystemMode = esp1SystemMode;
-    cmdTime = lastMotorCmdTime;
-  }
-
   Serial.println();
   Serial.println("===== ESP2 MOTOR + DST-WLTC =====");
-  Serial.print("WiFi                  : "); Serial.println(wifiConnectedFlag ? "CONNECTED" : "DISCONNECTED");
-  Serial.print("MQTT                  : "); Serial.println(mqttWasConnected ? "CONNECTED" : "DISCONNECTED");
-  Serial.print("Motor CMD Timeout     : "); Serial.println(((cmdTime == 0) || (millis() - cmdTime > MOTOR_CMD_TIMEOUT_MS)) ? "YES" : "NO");
-  Serial.print("ESP1 Motor Enable     : "); Serial.println(cmdMotorEnable ? "YES" : "NO");
-  Serial.print("ESP1 Battery Safe     : "); Serial.println(cmdBatterySafe ? "YES" : "NO");
-  Serial.print("Load Stage            : "); Serial.println(cmdLoadStage);
-  Serial.print("ESP1 System Mode      : "); Serial.println(cmdSystemMode);
+  Serial.print("WiFi                  : "); Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+  Serial.print("MQTT                  : "); Serial.println(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED");
+  Serial.print("Motor CMD Timeout     : "); Serial.println(((lastMotorCmdTime == 0) || (millis() - lastMotorCmdTime > MOTOR_CMD_TIMEOUT_MS)) ? "YES" : "NO");
+  Serial.print("ESP1 Motor Enable     : "); Serial.println(motorEnableFromEsp1 ? "YES" : "NO");
+  Serial.print("ESP1 Battery Safe     : "); Serial.println(batterySafeFromEsp1 ? "YES" : "NO");
+  Serial.print("Load Stage            : "); Serial.println(loadStage);
+  Serial.print("ESP1 System Mode      : "); Serial.println(esp1SystemMode);
   Serial.print("Motor Actually Enabled: "); Serial.println(motorActuallyEnabled ? "YES" : "NO");
   Serial.print("WLTC Second           : "); Serial.println(wltcSecond);
   Serial.print("WLTC Speed            : "); Serial.print(wltcSpeedKmh, 2); Serial.println(" km/h");
@@ -1895,32 +1809,15 @@ void setup() {
 
   setupWiFi();
   setupMQTT();
-
-  // Mutex hanya untuk data command yang dibagi antara Network+MQTT task
-  // dan Arduino loop. mqttClient dan maintenance WiFi hanya diakses task ini.
-  commandMutex = xSemaphoreCreateMutex();
-  if (commandMutex == nullptr) {
-    Serial.println("[MQTT] ERROR: command mutex creation failed.");
-  }
-
-  // Pisahkan seluruh aktivitas WiFi + MQTT dari Arduino loop.
-  // Task menggunakan Core 0 agar loop utama tetap fokus
-  // pada sensor dan kontrol motor.
-  xTaskCreatePinnedToCore(
-    networkMqttTask,
-    "Network_MQTT_Task",
-    8192,
-    nullptr,
-    2,
-    &networkMqttTaskHandle,
-    0
-  );
 }
 
 void loop() {
   static unsigned long lastControl = 0;
   static unsigned long lastSensor = 0;
   static unsigned long lastPrint = 0;
+
+  maintainWiFi();
+  maintainMQTT();
 
   unsigned long now = millis();
 
@@ -1941,28 +1838,12 @@ void loop() {
     updateWltcControl();
   }
 
-  // Reset encoder diproses di Arduino loop, bukan langsung dari
-  // callback MQTT, agar akses encoder tidak bersamaan dengan updateRpm().
-  if (resetPositionRequest) {
-    if (commandMutex != nullptr) {
-      xSemaphoreTake(commandMutex, portMAX_DELAY);
-      if (resetPositionRequest) {
-        resetPositionRequest = false;
-        xSemaphoreGive(commandMutex);
-        resetEncoderPosition();
-        Serial.println("Encoder position reset to 0 degree.");
-      } else {
-        xSemaphoreGive(commandMutex);
-      }
-    } else {
-      resetPositionRequest = false;
-      resetEncoderPosition();
-      Serial.println("Encoder position reset to 0 degree.");
-    }
-  }
-
-  // LM35 berjalan non-blocking.
+  // LM35 berjalan non-blocking sehingga tidak menghambat MQTT.
   updateLm35Sensor();
+
+  // Layani MQTT lagi setelah pekerjaan sensor/kontrol sebelum publish.
+  maintainMQTT();
+  publishMotorData();
 
   if (now - lastPrint >= 5000) {
     lastPrint = now;
