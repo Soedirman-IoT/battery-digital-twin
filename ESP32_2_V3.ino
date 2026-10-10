@@ -41,7 +41,7 @@ const unsigned long WIFI_RESTART_TIMEOUT_MS = 120000; // 2 menit
 const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 2000;
-const unsigned long MOTOR_CMD_TIMEOUT_MS = 10000;
+const unsigned long MOTOR_CMD_TIMEOUT_MS = 30000;
 
 // MQTT connection stability
 const uint16_t MQTT_KEEPALIVE_SEC = 60;
